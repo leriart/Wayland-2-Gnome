@@ -24,6 +24,10 @@ struct Cli {
     #[arg(long, default_value = "wayland-bridge-0")]
     socket: String,
 
+    /// Compositor socket name (default: wayland-0)
+    #[arg(long, default_value = "wayland-0")]
+    compositor: String,
+
     /// Path to TOML config file
     #[arg(long)]
     config: Option<String>,
@@ -59,8 +63,9 @@ fn main() -> Result<()> {
         info!("Loaded config from {}", cfg_path);
     }
 
-    // CLI --socket overrides config file and default
+    // CLI --socket and --compositor override config file and default
     config.bridge_display = cli.socket;
+    config.compositor_display = cli.compositor;
 
     // Apply log level from config if set
     if let Some(ref level) = config.log_level {
