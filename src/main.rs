@@ -23,6 +23,10 @@ struct Cli {
     /// Bridge socket name (default: wayland-bridge-0)
     #[arg(long, default_value = "wayland-bridge-0")]
     socket: String,
+
+    /// Path to TOML config file
+    #[arg(long)]
+    config: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -46,12 +50,28 @@ fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     install_signal_handlers(shutdown.clone())?;
 
-    let sock_name = cli.socket.clone();
+    // Load config: start with defaults, optionally merge from file, then CLI overrides
+    let mut config = proxy::BridgeConfig::default();
 
-    let config = proxy::BridgeConfig {
-        bridge_display: cli.socket,
-        ..Default::default()
-    };
+    if let Some(ref cfg_path) = cli.config {
+        let file_cfg = proxy::BridgeConfig::from_file(cfg_path)?;
+        config.merge(&file_cfg);
+        info!("Loaded config from {}", cfg_path);
+    }
+
+    // CLI --socket overrides config file and default
+    config.bridge_display = cli.socket;
+
+    // Apply log level from config if set
+    if let Some(ref level) = config.log_level {
+        env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or(level),
+        )
+        .init();
+        info!("Log level set to '{}' from config", level);
+    }
+
+    let sock_name = config.bridge_display.clone();
 
     info!(
         "Wayland 2 GNOME on '{}', proxying to '{}'",

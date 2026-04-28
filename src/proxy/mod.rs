@@ -378,18 +378,64 @@ pub fn run_with_shutdown(cfg: BridgeConfig, shutdown: Arc<AtomicBool>) -> Result
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
+/// Bridge configuration, loadable from TOML or CLI defaults.
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct BridgeConfig {
+    /// Unix socket name for the bridge (e.g. "wayland-bridge-0")
+    #[serde(default = "default_bridge_display")]
     pub bridge_display: String,
+    /// Compositor Wayland display (e.g. "wayland-0")
+    #[serde(default = "default_compositor_display")]
     pub compositor_display: String,
+    /// Max client threads (0 = unlimited, default)
+    #[serde(default)]
+    pub max_clients: u32,
+    /// Log level filter (overrides env_logger default)
+    #[serde(default)]
+    pub log_level: Option<String>,
+}
+
+fn default_bridge_display() -> String {
+    "wayland-bridge-0".into()
+}
+
+fn default_compositor_display() -> String {
+    std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into())
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
-            bridge_display: "wayland-bridge-0".into(),
-            compositor_display: std::env::var("WAYLAND_DISPLAY")
-                .unwrap_or_else(|_| "wayland-0".into()),
+            bridge_display: default_bridge_display(),
+            compositor_display: default_compositor_display(),
+            max_clients: 0,
+            log_level: None,
+        }
+    }
+}
+
+impl BridgeConfig {
+    /// Load from a TOML file path. Missing fields use defaults.
+    pub fn from_file(path: &str) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Cannot read config '{}': {}", path, e))?;
+        let config: BridgeConfig = toml::from_str(&content)?;
+        Ok(config)
+    }
+
+    /// Merge another config into self (non-default fields override).
+    pub fn merge(&mut self, other: &BridgeConfig) {
+        if other.bridge_display != default_bridge_display() {
+            self.bridge_display.clone_from(&other.bridge_display);
+        }
+        if other.compositor_display != default_compositor_display() {
+            self.compositor_display.clone_from(&other.compositor_display);
+        }
+        if other.max_clients != 0 {
+            self.max_clients = other.max_clients;
+        }
+        if other.log_level.is_some() {
+            self.log_level.clone_from(&other.log_level);
         }
     }
 }
