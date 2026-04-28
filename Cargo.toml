@@ -3,7 +3,7 @@ name = "wayland-gnome-bridge"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Protocol-aware Wayland proxy translating wlr-layer-shell to GNOME Shell overlays"
+description = "Protocol-aware Wayland proxy translating wlr-layer-shell to GNOME Shell overlays. Selective byte-level sniff-and-forward with per-client connections."
 authors = ["Leriart"]
 repository = "https://github.com/leriart/wayland-gnome-bridge"
 

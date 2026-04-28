@@ -12,103 +12,83 @@ GNOME Shell / Mutter explicitly does **not** implement `zwlr_layer_shell_v1`. Ap
 layer shell not available: the requested global was not found in the registry
 ```
 
-## The Solution
-
-This project sits as a **Wayland proxy** between the app and GNOME Mutter:
-
-```
-┌──────────────┐      Wayland socket       ┌──────────────────┐      real Wayland socket       ┌────────────┐
-│ App (cava-bg)│ ◄─────────────────────────►│ wayland-gnome-bridge │ ◄────────────────────────────►│ GNOME      │
-│              │      zwlr_layer_shell      │                  │      xdg_shell + extensions    │ Mutter     │
-│              │      wl_compositor         │  Proxy Server    │      wl_compositor              │ Compositor │
-└──────────────┘      wl_shm etc.           └──────────────────┘      wl_shm etc.                 └────────────┘
-```
-
-### How it works
-
-1. **Starts a fake Wayland compositor** on a custom socket (e.g., `$XDG_RUNTIME_DIR/wayland-gnome-bridge-0`)
-2. **Connects to the real GNOME Mutter** on the actual `$WAYLAND_DISPLAY`
-3. **Acts as a transparent proxy** for all standard Wayland protocols (`wl_compositor`, `wl_shm`, `wl_subcompositor`, etc.)
-4. **Intercepts `zwlr_layer_shell_v1`** calls and translates them into:
-   - **Background layer** → xdg_shell window positioned behind (rendered to a texture via offscreen wgpu/EGL, composited by the GNOME extension)
-   - **Overlay / Panel layer** → GNOME Shell extension that paints the surface as an on-screen `St.ImageContent`
-5. **Forwards input events** (mouse, keyboard) from GNOME back to the proxied app
-
 ## Architecture
 
+The bridge sits between the app and the real compositor, selectively intercepting only the protocols it needs to translate:
+
 ```
-wayland-gnome-bridge/
-├── src/
-│   ├── main.rs              # Entry point: socket setup, daemon mode
-│   ├── proxy/
-│   │   ├── mod.rs            # Core proxy loop: read from client → dispatch → forward to compositor
-│   │   ├── connection.rs     # Client & compositor socket management
-│   │   ├── registry.rs       # Global registry: filter/modify globals exposed to client
-│   │   └── object_map.rs     # Maps object IDs between client and compositor sides
-│   ├── translate/
-│   │   ├── mod.rs            # Translation dispatcher
-│   │   ├── layer_shell.rs    # zwlr_layer_shell_v1 → xdg_shell + compositor calls
-│   │   └── xdg_shell.rs      # xdg_shell passthrough helpers
-│   ├── output/
-│   │   ├── mod.rs            # Output management (virtual outputs for layers)
-│   │   └── capture.rs        # Frame capture → pipe to GNOME extension
-│   └── gnome_extension/      # The GNOME Shell extension side
-│       ├── extension.js      # Receives frames via socket, paints as overlay
-│       ├── metadata.json
-│       └── schemas/          # GSettings for configuration
-├── Cargo.toml
-└── README.md
+┌──────────────┐   wayland-bridge-0   ┌──────────────────────┐    WAYLAND_DISPLAY    ┌────────────┐
+│   App /      │ ◄───────────────────►│ wayland-gnome-bridge │ ◄────────────────────►│  Compositor │
+│   Client     │     (fake socket)    │  (sniff & forward)   │    (real socket)     │ (Mutter /   │
+│              │                      │                      │                      │  Hyprland)  │
+└──────────────┘                      └──────────────────────┘                      └────────────┘
 ```
 
-## Phase 1: Minimal Viable Proxy (MVP)
+### Design
 
-The first milestone is a **raw passthrough proxy** that:
-- Listens on a custom Unix socket
-- Connects to GNOME Mutter
-- Forwards every message transparently (byte-level passthrough)
-- Runs an app transparently through it (same behavior as direct connection)
+- **Per-client connection**: Each app gets its own thread + compositor connection
+- **Sniff-mode global collection**: The bridge forwards `wl_display.get_registry` raw and passively collects global info from the compositor's response
+- **Raw passthrough (Phase 4)**: All messages forwarded byte-for-byte. No interception yet
+- **Two-step message reading**: Reads exactly one message per `recvmsg()` call (header first, then payload) to avoid consuming trailing data from compositor batches
+- **Fully transparent**: Works with any Wayland client, including GPU-accelerated apps via EGL/wgpu
 
-This proves the proxying mechanism works.
+The bridge currently passes the layer shell test (create surface, get layer surface, receive configure) in transparent proxy mode against Hyprland.
 
-## Phase 2: Protocol Interception
+### Phase Roadmap
 
-- Intercept `wl_display.get_registry` → modify/filter globals exposed
-- Intercept `zwlr_layer_shell_v1` → intercept all its objects and requests
-- For all other globals: transparent passthrough
+| Phase | Status | Description |
+|-------|--------|-------------|
+| 1  | ✅ Done | Raw byte-level proxy (passthrough, no parsing) |
+| 2  | ✅ Done | Protocol-aware proxy with `wayland_server` dispatchers |
+| 3a | ✅ Done | Expose `zwlr_layer_shell_v1` global from bridge |
+| 3b | ✅ Done | Intercept `get_layer_surface`, simulate protocol |
+| **4** | **✅ Active** | **Transparent proxy with passive sniffing, per-client connections** |
+| 5 | 📋 Plan | Intercept `zwlr_layer_shell_v1`, translate to xdg_shell for Mutter |
+| 6 | 🧪 Plan | GNOME Shell extension for rendering layer surfaces |
 
-## Phase 3: Layer → Surface Translation
+## Key Technical Decisions
 
-- Translate `zwlr_layer_shell_v1.get_layer_surface` into an xdg_toplevel with special properties
-- Handle:
-  - Anchor mappings (top, bottom, left, right, center)
-  - Layer stacking (background, bottom, top, overlay)
-  - Exclusive zones
-  - Keyboard interactivity
-- Surface the app's wl_surface as an xdg_surface under GNOME
+### Why sniff-mode instead of separate registry?
 
-## Phase 4: GNOME Shell Extension
+**Problem**: Using a bridge-side `get_registry` on the compositor connection creates OID conflicts because the client also sends `get_registry(2)`. Both would share the same compositor socket, leading to two registry objects at OID 2 — a protocol violation.
 
-- Unix socket listener in GJS that receives the app's rendered frames
-- `St.ImageContent` + `Clutter.Actor` overlay painting
-- Multi-monitor support
-- Click-through mode (reactive: false)
+**Solution**: Forward the client's `get_registry` raw and **sniff** the compositor's global events as they pass through. No separate bridge registry connection needed.
 
-## Phase 5: Polish
+### Why two-step recvmsg?
 
-- Config file (`~/.config/wayland-gnome-bridge/config.toml`)
-- Auto-detection of running compositor
-- `systemd --user` service integration
-- App-specific rules (which layers go where)
+**Problem**: Wayland compositors batch multiple messages in a single socket write. A single `recvmsg` with a large buffer (65536 bytes) reads ALL queued data, but naive code only processes the first message.
 
-## How to Contribute
+**Solution**: Read 8 bytes (header), extract message size, then read exactly the remaining payload. This guarantees one message per `read_raw()` call.
 
-This is a complex project that touches:
-- **Rust** (Wayland protocol, wayland-server, wl-proxy)
-- **GJS** (GNOME Shell Extension)
-- **Wayland internals** (wl_registry, object IDs, protocol marshalling)
-- **wgpu/EGL** (offscreen rendering)
+## Building
 
-Check the [issues](https://github.com/leriart/wayland-gnome-bridge/issues) for open tasks.
+```bash
+git clone https://github.com/leriart/wayland-gnome-bridge
+cd wayland-gnome-bridge
+cargo build --release
+```
+
+## Usage
+
+```bash
+# On Hyprland (or any compositor with zwlr_layer_shell_v1):
+RUST_LOG=info WAYLAND_DISPLAY=wayland-1 ./target/release/wayland-gnome-bridge
+
+# In another terminal, run your app through the bridge:
+WAYLAND_DISPLAY=wayland-bridge-0 cava-bg
+```
+
+The bridge listens on `$XDG_RUNTIME_DIR/wayland-bridge-0` by default and connects to `$WAYLAND_DISPLAY`.
+
+## Current Status
+
+- ✅ **Phase 4**: Transparent proxy working end-to-end
+- ✅ All 66 Hyprland globals correctly collected
+- ✅ `zwlr_layer_shell_v1` binds forward correctly
+- ✅ Layer surface creation and configure events pass through
+- ✅ `wl_surface.commit()` triggers compositor configure as expected
+- ✅ Session cleanup on client disconnect
+- ❌ Layer→xdg protocol translation not yet implemented (Phase 5)
 
 ## Related Projects
 
