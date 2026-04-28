@@ -1018,6 +1018,23 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
 
     let global_name = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
     let new_id = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+
+    // Always intercept binds to our fake injected global (name=1000),
+    // whether it's the first bind or repeated binds from SCT internals.
+    if global_name == FAKE_GLOBAL_LAYER_SHELL {
+        info!("  🎣 intercepted fake bind for zwlr_layer_shell_v1 → cli_oid={new_id}");
+        let already_tracked = s.fake_objects.iter().any(|f| f.cli_oid == new_id);
+        if !already_tracked {
+            s.fake_objects.push(FakeObject {
+                cli_oid: new_id,
+                iface: "zwlr_layer_shell_v1".into(),
+                next_sub_oid: new_id + 1,
+                data: String::new(),
+            });
+        }
+        return Ok(());
+    }
+
     let global = s.comp_globals.iter().find(|g| g.name == global_name);
     let iface = global.map(|g| g.interface.as_str()).unwrap_or("?");
     info!("bind: name={global_name}, new_id={new_id}, iface={iface}");
@@ -1027,20 +1044,16 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
         info!("  identified xdg_wm_base at cli_oid={new_id}");
     }
 
-    // If this is our injected layer shell, don't forward to compositor
-    if global_name == FAKE_GLOBAL_LAYER_SHELL {
-        info!("  🎣 intercepted fake bind for zwlr_layer_shell_v1 → cli_oid={new_id}");
-        s.fake_objects.push(FakeObject {
-            cli_oid: new_id,
-            iface: "zwlr_layer_shell_v1".into(),
-            next_sub_oid: new_id + 1,
-            data: String::new(),
-        });
-        // All subsequent messages to this OID are handled internally
+    // ⚠ Safety check: if the client is binding a global that doesn't exist
+    // in the compositor's actual list (not counting our injected globals),
+    // do NOT forward it — the compositor will reject it and disconnect.
+    let is_real_global = s.comp_globals.iter().any(|g| g.name == global_name && g.interface != "zwlr_layer_shell_v1");
+    if global_name != FAKE_GLOBAL_LAYER_SHELL && !is_real_global {
+        warn!("  ⚠ intercepted bind to unknown global name={}, iface='{}' — preventing compositor error", global_name, iface);
         return Ok(());
     }
 
-    // Real global: forward to compositor
+    // Forward to compositor
     send_raw(&s.to_comp, msg)
 }
 
