@@ -16,7 +16,7 @@ fn main() -> Result<()> {
 
     let config = proxy::BridgeConfig::default();
     info!(
-        "Bridge Phase 4 on '{}', proxying to '{}'",
+        "Wayland 2 GNOME on '{}', proxying to '{}'",
         format!("/run/user/1000/{}", config.bridge_display),
         config.compositor_display
     );

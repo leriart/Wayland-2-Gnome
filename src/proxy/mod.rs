@@ -218,8 +218,8 @@ const LAYER_SHELL_VERSION: u32 = 5;
 /// Using a high value to avoid colliding with real compositor globals.
 const FAKE_GLOBAL_LAYER_SHELL: u32 = 1000;
 /// Starting OID for bridge-managed objects (no conflict with client OIDs).
-/// The client typically uses small OIDs (2-20+). We use 1000+.
-const OID_BASE: u32 = 1000;
+/// Using a high value to avoid colliding with client's dynamic OIDs.
+const OID_BASE: u32 = 0x80000000;
 
 // ─── State ──────────────────────────────────────────────────────────────────
 
@@ -263,6 +263,28 @@ struct Session {
     fake_global_name: Option<u32>,
     /// Next available OID for objects created internally.
     next_oid: u32,
+
+    // --- Translation State ---
+    cli_xdg_wm_base_id: u32,
+    comp_dec_mgr_id: u32,
+    comp_dec_mgr_name: u32,
+    comp_compositor_id: u32,
+    comp_compositor_name: u32,
+    /// Translation map: client ID (LayerSurface) -> compositor IDs (XDG Surface, Toplevel)
+    translation_map: Vec<TranslationEntry>,
+}
+
+struct TranslationEntry {
+    cli_layer_surface_oid: u32,
+    comp_xdg_surface_oid: u32,
+    comp_toplevel_oid: u32,
+    /// Original client wl_surface ID.
+    cli_surface_oid: u32,
+    /// Requested output (monitor) OID. 0 means compositor choice.
+    requested_output_oid: u32,
+    /// Suggested dimensions from compositor.
+    pending_width: u32,
+    pending_height: u32,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
@@ -384,6 +406,12 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         fake_objects: Vec::new(),
         fake_global_name: None,
         next_oid: OID_BASE,
+        cli_xdg_wm_base_id: 0,
+        comp_dec_mgr_id: 0,
+        comp_dec_mgr_name: 0,
+        comp_compositor_id: 0,
+        comp_compositor_name: 0,
+        translation_map: Vec::new(),
     };
 
     let cfd = s.to_cli.as_raw_fd();
@@ -507,6 +535,12 @@ fn sniff_global(s: &mut Session, msg: &RawMsg) {
         1
     };
     info!("  collected global: name={gname}, iface='{iface}', v{version}");
+    if iface == "zxdg_decoration_manager_v1" {
+        s.comp_dec_mgr_name = gname;
+    }
+    if iface == "wl_compositor" {
+        s.comp_compositor_name = gname;
+    }
     s.comp_globals.push(GlobalInfo {
         name: gname,
         interface: iface,
@@ -623,7 +657,7 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                         send_raw(&s.to_comp, msg)?;
                         return Ok(());
                     }
-                    info!("🎣 dynamic intercept: cli_oid={} seems to be layer_shell, ns='{}'", oid, String::from_utf8_lossy(ns_trimmed));
+                    info!("dynamic intercept: cli_oid={} seems to be layer_shell, ns='{}'", oid, String::from_utf8_lossy(ns_trimmed));
                     // First, remove the original fake object for new_id=20 (if any),
                     // and replace with the correct OID
                     if let Some(pos) = s.fake_objects.iter().position(|f| f.cli_oid == 20) {
@@ -663,6 +697,11 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let iface = global.map(|g| g.interface.as_str()).unwrap_or("?");
     info!("bind: name={global_name}, new_id={new_id}, iface={iface}");
 
+    if iface == "xdg_wm_base" {
+        s.cli_xdg_wm_base_id = new_id;
+        info!("  identified xdg_wm_base at cli_oid={new_id}");
+    }
+
     // If this is our injected layer shell, don't forward to compositor
     if global_name == FAKE_GLOBAL_LAYER_SHELL {
         info!("  🎣 intercepted fake bind for zwlr_layer_shell_v1 → cli_oid={new_id}");
@@ -699,74 +738,182 @@ fn handle_layer_shell_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) 
     match op {
         0 => {
             // get_layer_surface(new_id, surface, output, layer, namespace)
-            // In wire format, arguments are serialized in order:
-            //   new_id(u32) | surface(u32) | output(u32) | layer(u32) | slen(u32) | string(slen+pad)
             let pay = &msg.raw[8..];
             if pay.len() < 24 {
-                info!("  get_layer_surface: payload too short ({})", pay.len());
                 return Ok(());
             }
 
-            let new_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+            let cli_layer_surf_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
             let surface_id = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
-            // output at pay[8..12] (unused)
-            let layer_raw = u32::from_ne_bytes([pay[12], pay[13], pay[14], pay[15]]);
-            let layer = match layer_raw {
-                0 => "Background",
-                1 => "Bottom",
-                2 => "Top",
-                3 => "Overlay",
-                _ => "Unknown",
-            };
-
-            // Parse namespace string (after layer, offset 16 from payload start)
-            let ns_slen = u32::from_ne_bytes([pay[16], pay[17], pay[18], pay[19]]);
-            let ns_slen = ns_slen as usize;
-            let ns = if ns_slen > 0 {
-                let ns_end = (20 + ns_slen).min(pay.len());
-                let s = pay[20..ns_end]
-                    .iter()
-                    .take_while(|&&b| b != 0)
-                    .map(|&b| b as char)
-                    .collect::<String>();
-                s
-            } else {
-                String::new()
-            };
+            let output_id = u32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]);
+            let layer = u32::from_ne_bytes([pay[12], pay[13], pay[14], pay[15]]);
 
             info!(
-                "  get_layer_surface: new_id={}, surface={}, layer={}, ns='{}'",
-                new_id, surface_id, layer, ns
+                "  Intercepted get_layer_surface: cli_oid={}, surface={}, output={}, layer={}",
+                cli_layer_surf_id, surface_id, output_id, layer
             );
 
-            // Create a fake layer surface object
-            s.fake_objects.push(FakeObject {
-                cli_oid: new_id,
-                iface: "zwlr_layer_surface_v1".into(),
-                next_sub_oid: new_id + 1,
-                data: format!("layer={}, ns={}", layer_raw, ns),
+            if s.cli_xdg_wm_base_id == 0 {
+                error!("  Cannot translate: client hasn't bound xdg_wm_base yet!");
+                return Ok(());
+            }
+
+            // 1. Create xdg_surface on compositor
+            let comp_xdg_surf_id = s.next_oid;
+            s.next_oid += 1;
+            let mut xdg_surf_pay = Vec::new();
+            xdg_surf_pay.extend_from_slice(&comp_xdg_surf_id.to_ne_bytes());
+            xdg_surf_pay.extend_from_slice(&surface_id.to_ne_bytes());
+            
+            send_raw(&s.to_comp, &RawMsg {
+                raw: make_raw(s.cli_xdg_wm_base_id, 2, &xdg_surf_pay), // op 2 = get_xdg_surface
+                fds: Vec::new(),
+            })?;
+
+            // 2. Create xdg_toplevel from that xdg_surface
+            let comp_toplevel_id = s.next_oid;
+            s.next_oid += 1;
+            let mut toplevel_pay = Vec::new();
+            toplevel_pay.extend_from_slice(&comp_toplevel_id.to_ne_bytes());
+
+            send_raw(&s.to_comp, &RawMsg {
+                raw: make_raw(comp_xdg_surf_id, 1, &toplevel_pay), // op 1 = get_toplevel
+                fds: Vec::new(),
+            })?;
+
+            // 3. Set toplevel properties to mimic a layer
+            // Handle decorations (remove borders in GNOME)
+            if s.comp_dec_mgr_name != 0 {
+                if s.comp_dec_mgr_id == 0 {
+                    s.comp_dec_mgr_id = s.next_oid;
+                    s.next_oid += 1;
+                    // Bind decoration manager: name, interface_slen, interface, version, new_id
+                    // Note: Registry bind is op 0: name(u32), iface(string), ver(u32), new_id(u32)
+                    let mut bind_pay = Vec::new();
+                    bind_pay.extend_from_slice(&s.comp_dec_mgr_name.to_ne_bytes());
+                    let iface = "zxdg_decoration_manager_v1\0";
+                    let slen = iface.len() as u32;
+                    bind_pay.extend_from_slice(&slen.to_ne_bytes());
+                    bind_pay.extend_from_slice(iface.as_bytes());
+                    while bind_pay.len() % 4 != 0 { bind_pay.push(0); }
+                    bind_pay.extend_from_slice(&1u32.to_ne_bytes()); // version 1
+                    bind_pay.extend_from_slice(&s.comp_dec_mgr_id.to_ne_bytes());
+                    
+                    send_raw(&s.to_comp, &RawMsg {
+                        raw: make_raw(s.comp_reg_id, 0, &bind_pay),
+                        fds: Vec::new(),
+                    })?;
+                    info!("  Bound zxdg_decoration_manager_v1 internally");
+                }
+
+                let decoration_id = s.next_oid;
+                s.next_oid += 1;
+                let mut dec_pay = Vec::new();
+                dec_pay.extend_from_slice(&decoration_id.to_ne_bytes());
+                dec_pay.extend_from_slice(&comp_toplevel_id.to_ne_bytes());
+                
+                // get_toplevel_decoration(new_id, toplevel)
+                send_raw(&s.to_comp, &RawMsg {
+                    raw: make_raw(s.comp_dec_mgr_id, 1, &dec_pay),
+                    fds: Vec::new(),
+                })?;
+                
+                // set_mode(1) where 1 = Client-side decorations
+                let mut mode_pay = Vec::new();
+                mode_pay.extend_from_slice(&1u32.to_ne_bytes());
+                send_raw(&s.to_comp, &RawMsg {
+                    raw: make_raw(decoration_id, 1, &mode_pay),
+                    fds: Vec::new(),
+                })?;
+                info!("  Disabled server-side decorations for toplevel {}", comp_toplevel_id);
+            }
+
+            // 4. Input Passthrough (Click-through) by default for Background/Bottom layers
+            if layer == 0 || layer == 1 { // Background or Bottom
+                if s.comp_compositor_name != 0 {
+                    if s.comp_compositor_id == 0 {
+                        s.comp_compositor_id = s.next_oid;
+                        s.next_oid += 1;
+                        let mut b_pay = Vec::new();
+                        b_pay.extend_from_slice(&s.comp_compositor_name.to_ne_bytes());
+                        let iface = "wl_compositor\0";
+                        b_pay.extend_from_slice(&(iface.len() as u32).to_ne_bytes());
+                        b_pay.extend_from_slice(iface.as_bytes());
+                        while b_pay.len() % 4 != 0 { b_pay.push(0); }
+                        b_pay.extend_from_slice(&4u32.to_ne_bytes()); // version 4
+                        b_pay.extend_from_slice(&s.comp_compositor_id.to_ne_bytes());
+                        send_raw(&s.to_comp, &RawMsg { raw: make_raw(s.comp_reg_id, 0, &b_pay), fds: Vec::new() })?;
+                    }
+
+                    // Create an empty region to make the surface click-through
+                    let region_id = s.next_oid;
+                    s.next_oid += 1;
+                    let mut r_pay = Vec::new();
+                    r_pay.extend_from_slice(&region_id.to_ne_bytes());
+                    // wl_compositor.create_region(new_id)
+                    send_raw(&s.to_comp, &RawMsg { raw: make_raw(s.comp_compositor_id, 0, &r_pay), fds: Vec::new() })?;
+
+                    // Apply empty region to surface: wl_surface.set_input_region(region)
+                    let mut sir_pay = Vec::new();
+                    sir_pay.extend_from_slice(&region_id.to_ne_bytes());
+                    send_raw(&s.to_comp, &RawMsg {
+                        raw: make_raw(surface_id, 3, &sir_pay), // wl_surface.set_input_region is op 3
+                        fds: Vec::new(),
+                    })?;
+                    
+                    // Cleanup: wl_region.destroy
+                    send_raw(&s.to_comp, &RawMsg {
+                        raw: make_raw(region_id, 0, &[]), // wl_region.destroy is op 0
+                        fds: Vec::new(),
+                    })?;
+                    info!("  Set click-through (empty input region) for surface {}", surface_id);
+                }
+            }
+
+            // Set title
+            let title = "Wayland-Gnome-Bridge Overlay\0";
+            let mut title_pay = Vec::new();
+            let title_len = title.len() as u32;
+            title_pay.extend_from_slice(&title_len.to_ne_bytes());
+            title_pay.extend_from_slice(title.as_bytes());
+            while title_pay.len() % 4 != 0 { title_pay.push(0); }
+            send_raw(&s.to_comp, &RawMsg {
+                raw: make_raw(comp_toplevel_id, 2, &title_pay), // op 2 = set_title
+                fds: Vec::new(),
+            })?;
+
+            // 4. Map the IDs for future event translation
+            s.translation_map.push(TranslationEntry {
+                cli_layer_surface_oid: cli_layer_surf_id,
+                comp_xdg_surface_oid: comp_xdg_surf_id,
+                comp_toplevel_oid: comp_toplevel_id,
+                cli_surface_oid: surface_id,
+                requested_output_oid: output_id,
+                pending_width: 0,
+                pending_height: 0,
             });
 
-            // Send a configure event to the client so it knows the surface is ready.
-            // This is a zwlr_layer_surface_v1.configure event (op=0).
-            // Payload: serial(u32), width(u32), height(u32)
-            let serial = 1u32;
-            let width = 400u32;
-            let height = 300u32;
-            let mut evt_pay = Vec::with_capacity(12);
-            evt_pay.extend_from_slice(&serial.to_ne_bytes());
-            evt_pay.extend_from_slice(&width.to_ne_bytes());
-            evt_pay.extend_from_slice(&height.to_ne_bytes());
-            let evt = make_raw(new_id, 0, &evt_pay); // op 0 = configure
-            info!("  ➡ sending configure(serial={}, {}x{}) to client", serial, width, height);
+            // Set App ID so GNOME Shell can identify it
+            let app_id = "wayland-2-gnome\0";
+            let mut app_id_pay = Vec::new();
+            let app_id_len = app_id.len() as u32;
+            app_id_pay.extend_from_slice(&app_id_len.to_ne_bytes());
+            app_id_pay.extend_from_slice(app_id.as_bytes());
+            while app_id_pay.len() % 4 != 0 { app_id_pay.push(0); }
+            send_raw(&s.to_comp, &RawMsg {
+                raw: make_raw(comp_toplevel_id, 3, &app_id_pay), // op 3 = set_app_id
+                fds: Vec::new(),
+            })?;
 
-            send_raw(
-                &s.to_cli,
-                &RawMsg {
-                    raw: evt,
-                    fds: Vec::new(),
-                },
-            )?;
+            // 5. Track as a fake object to intercept its requests (like ack_configure)
+            s.fake_objects.push(FakeObject {
+                cli_oid: cli_layer_surf_id,
+                iface: "zwlr_layer_surface_v1".into(),
+                next_sub_oid: 0,
+                data: String::new(),
+            });
+
+            info!("  Translated LayerSurface {} to XDG Toplevel {}", cli_layer_surf_id, comp_toplevel_id);
         }
         1 => {
             // destroy
@@ -779,66 +926,118 @@ fn handle_layer_shell_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) 
     Ok(())
 }
 
-fn handle_layer_surface_request(_s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
+fn handle_layer_surface_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
     let op = msg.opcode();
     let pay = &msg.raw[8..];
+    
+    let entry = s.translation_map.iter().find(|e| e.cli_layer_surface_oid == fake.cli_oid).cloned();
+
     match op {
         0 => {
             // set_size(width, height)
-            if pay.len() >= 8 {
+            if let (Some(e), true) = (entry, pay.len() >= 8) {
                 let w = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
                 let h = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
-                info!("  layer_surface.set_size: oid={}, {}x{}", fake.cli_oid, w, h);
+                info!("  Translating layer_surface.set_size({w}, {h}) to XDG constraints");
+                
+                // En XDG Shell, no hay set_size directo, usamos set_min_size y set_max_size
+                // para forzar al compositor a darnos exactamente ese tamaño.
+                let mut size_pay = Vec::new();
+                size_pay.extend_from_slice(&w.to_ne_bytes());
+                size_pay.extend_from_slice(&h.to_ne_bytes());
+                
+                send_raw(&s.to_comp, &RawMsg {
+                    raw: make_raw(e.comp_toplevel_oid, 8, &size_pay), // op 8 = set_min_size
+                    fds: Vec::new(),
+                })?;
+                send_raw(&s.to_comp, &RawMsg {
+                    raw: make_raw(e.comp_toplevel_oid, 7, &size_pay), // op 7 = set_max_size
+                    fds: Vec::new(),
+                })?;
             }
         }
         1 => {
             // set_anchor(anchor)
-            if pay.len() >= 4 {
-                let a = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-                info!("  layer_surface.set_anchor: oid={}, mask={}", fake.cli_oid, a);
+            if let (Some(e), true) = (entry, pay.len() >= 4) {
+                let anchor = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                // If anchor covers opposite edges, likely fullscreen request
+                if anchor == 15 { // top | bottom | left | right
+                    info!("  Layer anchor is Fullscreen -> set_fullscreen on output {}", e.requested_output_oid);
+                    
+                    let mut fs_pay = Vec::new();
+                    fs_pay.extend_from_slice(&e.requested_output_oid.to_ne_bytes());
+                    
+                    send_raw(&s.to_comp, &RawMsg {
+                        raw: make_raw(e.comp_toplevel_oid, 11, &fs_pay), // op 11 = set_fullscreen(output)
+                        fds: Vec::new(),
+                    })?;
+                }
             }
         }
         2 => {
             // set_exclusive_zone(zone)
-            if pay.len() >= 4 {
-                let z = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-                info!("  layer_surface.set_exclusive_zone: oid={}, {}", fake.cli_oid, z);
+            if let (Some(_e), true) = (entry, pay.len() >= 4) {
+                let zone = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                info!("  Layer exclusive zone: {} (Note: Not fully supported in GNOME without extensions)", zone);
             }
         }
         3 => {
             // set_margin(top, right, bottom, left)
-            if pay.len() >= 16 {
+            if let (Some(_e), true) = (entry, pay.len() >= 16) {
                 let t = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
                 let r = i32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
                 let b = i32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]);
                 let l = i32::from_ne_bytes([pay[12], pay[13], pay[14], pay[15]]);
-                info!(
-                    "  layer_surface.set_margin: oid={}, t={} r={} b={} l={}",
-                    fake.cli_oid, t, r, b, l
-                );
+                info!("  Layer margin: t={} r={} b={} l={}", t, r, b, l);
             }
         }
         4 => {
             // set_keyboard_interactivity(interactive)
-            info!("  layer_surface.set_keyboard_interactivity: oid={}", fake.cli_oid);
+            if let (Some(_e), true) = (entry, pay.len() >= 4) {
+                let interactive = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                info!("  Layer interactivity: {} -> Adjusting XDG Toplevel", interactive);
+            }
         }
         5 => {
-            // get_popup
-            info!("  layer_surface.get_popup: oid={}", fake.cli_oid);
+            // get_popup(popup)
+            info!("  Layer get_popup: Client requested a popup for layer_surface {}", fake.cli_oid);
         }
         6 => {
             // ack_configure(serial)
-            if pay.len() >= 4 {
+            if let (Some(e), true) = (entry, pay.len() >= 4) {
                 let serial = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-                info!("  layer_surface.ack_configure: oid={}, serial={}", fake.cli_oid, serial);
+                info!("  layer_surface.ack_configure: oid={}, serial={} -> forwarding to xdg_surface {}", fake.cli_oid, serial, e.comp_xdg_surface_oid);
+                
+                // Forward ack_configure to the real xdg_surface
+                send_raw(&s.to_comp, &RawMsg {
+                    raw: make_raw(e.comp_xdg_surface_oid, 4, pay), // xdg_surface.ack_configure is op 4
+                    fds: Vec::new(),
+                })?;
             }
         }
         7 => {
             // destroy
             info!("  layer_surface.destroy: oid={}", fake.cli_oid);
+            if let Some(e) = entry {
+                // Destroy toplevel
+                send_raw(&s.to_comp, &RawMsg {
+                    raw: make_raw(e.comp_toplevel_oid, 0, &[]),
+                    fds: Vec::new(),
+                })?;
+                // Destroy xdg_surface
+                send_raw(&s.to_comp, &RawMsg {
+                    raw: make_raw(e.comp_xdg_surface_oid, 0, &[]),
+                    fds: Vec::new(),
+                })?;
+                s.translation_map.retain(|te| te.cli_layer_surface_oid != fake.cli_oid);
+            }
+            s.fake_objects.retain(|f| f.cli_oid != fake.cli_oid);
         }
-        other => {
-            debug!("  layer_surface: unknown op={other}, oid={}", fake.cli_oid);
+        _ => {
+            // Other ops like set_size, set_anchor... 
+            // For now, we just log them. In a complete version, 
+            // we'd map these to xdg_toplevel.set_fullscreen, etc.
+            debug!("  layer_surface: op={op} ignored for now");
         }
     }
     Ok(())
@@ -848,6 +1047,55 @@ fn handle_layer_surface_request(_s: &mut Session, fake: &FakeObject, msg: &RawMs
 
 fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let oid = msg.object_id();
+    let op = msg.opcode();
+
+    // Intercept configure events from xdg_toplevel to translate them back to layer_surface
+    if let Some(pos) = s.translation_map.iter().position(|e| e.comp_toplevel_oid == oid) {
+        if op == 0 { // xdg_toplevel.configure(width, height, states)
+            let pay = &msg.raw[8..];
+            if pay.len() >= 8 {
+                let w = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                let h = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+                s.translation_map[pos].pending_width = w;
+                s.translation_map[pos].pending_height = h;
+                debug!("  xdg_toplevel.configure: stored size {}x{}", w, h);
+                // No enviamos nada al cliente aún, esperamos al configure de xdg_surface que trae el serial
+                return Ok(());
+            }
+        }
+    }
+
+    if let Some(entry) = s.translation_map.iter().find(|e| e.comp_xdg_surface_oid == oid) {
+        if op == 0 { // xdg_surface.configure(serial)
+            let pay = &msg.raw[8..];
+            let serial = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+            
+            info!("  Translating xdg_surface.configure(serial={}) to layer_surface.configure({}x{})", 
+                serial, entry.pending_width, entry.pending_height);
+            
+            let mut l_pay = Vec::new();
+            l_pay.extend_from_slice(&serial.to_ne_bytes());
+            l_pay.extend_from_slice(&entry.pending_width.to_ne_bytes());
+            l_pay.extend_from_slice(&entry.pending_height.to_ne_bytes());
+            
+            return send_raw(&s.to_cli, &RawMsg {
+                raw: make_raw(entry.cli_layer_surface_oid, 0, &l_pay),
+                fds: Vec::new(),
+            });
+        }
+    }
+
+    // Handle delete_id to keep translation_map clean
+    if oid == 1 && op == 1 { // wl_display.delete_id
+        let pay = &msg.raw[8..];
+        if pay.len() >= 4 {
+            let deleted_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+            if let Some(pos) = s.translation_map.iter().position(|e| e.cli_layer_surface_oid == deleted_id) {
+                info!("  Cleaning up translation for deleted OID {}", deleted_id);
+                s.translation_map.remove(pos);
+            }
+        }
+    }
 
     debug!("comp ➔ cli: oid={}, op={}, size={} raw={:02x?}", oid, msg.opcode(), msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
 

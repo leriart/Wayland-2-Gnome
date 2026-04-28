@@ -1,101 +1,108 @@
-# Wayland GNOME Bridge 🏗️
+# Wayland 2 GNOME
 
-**A protocol-aware Wayland proxy that translates `wlr-layer-shell` calls into GNOME Shell overlays.**
+**A high-performance protocol translation proxy that brings wlr-layer-shell applications to GNOME Shell.**
 
-Make any Wayland app that uses `zwlr_layer_shell_v1` work inside GNOME Shell (Mutter) without Mutter implementing the protocol.
+Make tools like cava-bg, waybar, rofi, and swaylock work seamlessly on GNOME (Mutter) without waiting for native protocol support.
+
+---
 
 ## The Problem
 
-GNOME Shell / Mutter explicitly does **not** implement `zwlr_layer_shell_v1`. Apps like `cava-bg`, `rofi`, `eww`, `swaylock`, and many others depend on this protocol for overlays, backgrounds, and panels. On GNOME, they crash with:
+GNOME's compositor (Mutter) does not implement the zwlr_layer_shell_v1 protocol used by many specialized Wayland desktop components. When running these apps on GNOME, they usually exit with:
+`layer shell not available: the requested global was not found in the registry`
 
-```
-layer shell not available: the requested global was not found in the registry
-```
+## The Solution
+
+**Wayland 2 GNOME** acts as an intelligent intermediary. It intercepts the connection between the app and Mutter, and when it detects a Layer Shell request, it translates it on-the-fly into a standard GNOME-compatible XDG surface.
+
+### Key Capabilities
+
+*   **Zero-Latency Proxy**: Forwards GPU buffers (DMA-BUF) and shared memory (SHM) directly, ensuring no performance penalty.
+*   **Intelligent Translation**: Maps LayerSurface requests to xdg_toplevel windows.
+*   **Stealth Mode**: Automatically forces Client-Side Decorations (CSD) to hide window titles and borders, making apps look like true system layers.
+*   **Input Passthrough**: Automatically configures empty input regions for background layers so mouse clicks pass through to the desktop.
+*   **Multi-Monitor Aware**: Respects application requests for specific monitors/outputs.
+*   **Dynamic Injection**: Only activates when needed; if the compositor already supports Layer Shell, it can stay in passive mode.
+
+---
 
 ## Architecture
 
-The bridge sits between the app and the real compositor, selectively intercepting only the protocols it needs to translate:
-
 ```
-┌──────────────┐   wayland-bridge-0   ┌──────────────────────┐    WAYLAND_DISPLAY    ┌────────────┐
-│   App /      │ ◄───────────────────►│ wayland-gnome-bridge │ ◄────────────────────►│  Compositor │
-│   Client     │     (fake socket)    │  (sniff & forward)   │    (real socket)     │ (Mutter /   │
-│              │                      │                      │                      │  Hyprland)  │
-└──────────────┘                      └──────────────────────┘                      └────────────┘
+┌──────────────┐      wayland-bridge-0      ┌──────────────────────┐      WAYLAND_DISPLAY     ┌────────────┐
+│   Client     │ <────────────────────────> │   Wayland 2 GNOME    │ <──────────────────────> │  Compositor │
+│ (e.g. Waybar)│      (Fake Registry)       │  (Translation Logic) │      (Real Socket)       │  (Mutter)   │
+└──────────────┘                            └──────────────────────┘                          └────────────┘
 ```
 
-### Design
+The bridge manages a complex 1-to-N mapping:
+- **1 Layer Surface** (App perspective) -> **1 XDG Surface + 1 XDG Toplevel + 1 Decoration Manager** (Compositor perspective).
 
-- **Per-client connection**: Each app gets its own thread + compositor connection
-- **Sniff-mode global collection**: The bridge forwards `wl_display.get_registry` raw and passively collects global info from the compositor's response
-- **Raw passthrough (Phase 4)**: All messages forwarded byte-for-byte. No interception yet
-- **Two-step message reading**: Reads exactly one message per `recvmsg()` call (header first, then payload) to avoid consuming trailing data from compositor batches
-- **Fully transparent**: Works with any Wayland client, including GPU-accelerated apps via EGL/wgpu
+---
 
-The bridge currently passes the layer shell test (create surface, get layer surface, receive configure) in transparent proxy mode against Hyprland.
+## Installation
 
-### Phase Roadmap
+### Prerequisites
+- Rust and Cargo (latest stable)
+- A Wayland-based GNOME session
 
-| Phase | Status | Description |
-|-------|--------|-------------|
-| 1  | ✅ Done | Raw byte-level proxy (passthrough, no parsing) |
-| 2  | ✅ Done | Protocol-aware proxy with `wayland_server` dispatchers |
-| 3a | ✅ Done | Expose `zwlr_layer_shell_v1` global from bridge |
-| 3b | ✅ Done | Intercept `get_layer_surface`, simulate protocol |
-| **4** | **✅ Active** | **Transparent proxy with passive sniffing, per-client connections** |
-| 5 | 📋 Plan | Intercept `zwlr_layer_shell_v1`, translate to xdg_shell for Mutter |
-| 6 | 🧪 Plan | GNOME Shell extension for rendering layer surfaces |
-
-## Key Technical Decisions
-
-### Why sniff-mode instead of separate registry?
-
-**Problem**: Using a bridge-side `get_registry` on the compositor connection creates OID conflicts because the client also sends `get_registry(2)`. Both would share the same compositor socket, leading to two registry objects at OID 2 — a protocol violation.
-
-**Solution**: Forward the client's `get_registry` raw and **sniff** the compositor's global events as they pass through. No separate bridge registry connection needed.
-
-### Why two-step recvmsg?
-
-**Problem**: Wayland compositors batch multiple messages in a single socket write. A single `recvmsg` with a large buffer (65536 bytes) reads ALL queued data, but naive code only processes the first message.
-
-**Solution**: Read 8 bytes (header), extract message size, then read exactly the remaining payload. This guarantees one message per `read_raw()` call.
-
-## Building
-
+### Build
 ```bash
-git clone https://github.com/leriart/wayland-gnome-bridge
-cd wayland-gnome-bridge
+git clone https://github.com/leriart/Wayland-2-Gnome
+cd Wayland-2-Gnome
 cargo build --release
 ```
 
+The binary will be available at `./target/release/wayland-2-gnome`.
+
+---
+
 ## Usage
 
-```bash
-# On Hyprland (or any compositor with zwlr_layer_shell_v1):
-RUST_LOG=info WAYLAND_DISPLAY=wayland-1 ./target/release/wayland-gnome-bridge
+1. **Start the bridge**:
+   ```bash
+   ./target/release/wayland-2-gnome
+   ```
+   *By default, it creates a new Wayland socket at $XDG_RUNTIME_DIR/wayland-bridge-0.*
 
-# In another terminal, run your app through the bridge:
-WAYLAND_DISPLAY=wayland-bridge-0 cava-bg
+2. **Run your app**:
+   ```bash
+   WAYLAND_DISPLAY=wayland-bridge-0 cava-bg
+   ```
+
+### Debugging
+You can see the translation in real-time by enabling logs:
+```bash
+RUST_LOG=info ./target/release/wayland-2-gnome
 ```
 
-The bridge listens on `$XDG_RUNTIME_DIR/wayland-bridge-0` by default and connects to `$WAYLAND_DISPLAY`.
+---
 
-## Current Status
+## Comparison
 
-- ✅ **Phase 4**: Transparent proxy working end-to-end
-- ✅ All 66 Hyprland globals correctly collected
-- ✅ `zwlr_layer_shell_v1` binds forward correctly
-- ✅ Layer surface creation and configure events pass through
-- ✅ `wl_surface.commit()` triggers compositor configure as expected
-- ✅ Session cleanup on client disconnect
-- ❌ Layer→xdg protocol translation not yet implemented (Phase 5)
+| Feature | Native GNOME | With Bridge |
+| :--- | :---: | :---: |
+| xdg_shell apps | Yes | Yes |
+| wlr-layer-shell apps | No (Crash) | Yes (Working) |
+| Transparent Overlays | No | Yes |
+| Click-through Backgrounds | No | Yes |
+| Borders & Titles | Forced | Hidden |
 
-## Related Projects
+---
 
-- [sommelier](https://chromium.googlesource.com/chromiumos/platform2/+/HEAD/vm_tools/sommelier/) — Chrome OS's proxy Wayland compositor (C++)
-- [wl-proxy](https://github.com/mahkoh/wl-proxy) — Rust crate for Wayland connection proxying
-- [cava-bg](https://github.com/leriart/cava-bg) — Audio visualizer for Wayland, the original motivation
+## Roadmap and Status
+
+- [x] **Phase 1-4**: High-speed byte-level proxying and global sniffing.
+- [x] **Phase 5**: Layer-to-XDG protocol translation core.
+- [x] **Phase 6**: Advanced window management (Decorations and Alpha).
+- [x] **Multi-Monitor**: Support for specific output targeting.
+- [x] **Garbage Collection**: Efficient OID cleanup on client disconnect.
+- [ ] **Interactive Popups**: Full support for sub-menus and tooltips.
+
+## Contributing
+
+Contributions are welcome! If you find a specific app that doesn't behave correctly through the bridge, please open an issue with the RUST_LOG=debug output.
 
 ## License
 
-MIT
+MIT License - Copyright (c) 2024 Leriart
