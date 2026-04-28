@@ -1,566 +1,419 @@
-//! Phase 3b: Proxy bridge with compositor backend.
+//! Phase 4: Selective Byte-Level Proxy
 //!
-//! Exposes `zwlr_layer_shell_v1` global and translates intercepted
-//! requests to real Mutter (wayland-1) calls via `wayland_client`.
+//! Acts as a Unix socket proxy between client and Hyprland.
+//! Intercepts ONLY `zwlr_layer_shell_v1` protocol messages and translates them.
+//! Everything else (EGL, wl_drm, wl_surface, Vulkan, etc.) passes through untouched.
 
+use std::collections::{HashMap, VecDeque};
+use std::os::unix::io::{AsRawFd, OwnedFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::{error, info, warn};
-use wayland_backend::server::{ClientData, ClientId, DisconnectReason};
-use wayland_client::globals::{GlobalListContents, registry_queue_init};
-use wayland_client::protocol::wl_compositor::WlCompositor as ClientWlCompositor;
-use wayland_client::protocol::wl_output::WlOutput as ClientWlOutput;
-use wayland_client::protocol::wl_registry::WlRegistry as ClientWlRegistry;
-use wayland_client::protocol::wl_seat::WlSeat as ClientWlSeat;
-use wayland_client::protocol::wl_surface::WlSurface as ClientWlSurface;
-use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
-use wayland_protocols_wlr::layer_shell::v1::server::{
-    zwlr_layer_shell_v1 as server_shell,
-    zwlr_layer_surface_v1 as server_surface,
-};
-use wayland_protocols_wlr::layer_shell::v1::client::{
-    zwlr_layer_shell_v1 as client_shell,
-    zwlr_layer_surface_v1 as client_surface,
-};
-use wayland_server::protocol::{
-    wl_compositor::WlCompositor,
-    wl_data_device_manager::WlDataDeviceManager,
-    wl_output::WlOutput,
-    wl_region::WlRegion,
-    wl_seat::WlSeat,
-    wl_shm::WlShm,
-    wl_subcompositor::WlSubcompositor,
-    wl_surface::WlSurface,
-};
-use wayland_server::{
-    Client, DataInit, Display, DisplayHandle, GlobalDispatch,
-    ListeningSocket, Resource, WEnum,
-};
+use nix::sys::socket::{recvmsg, sendmsg, ControlMessageOwned, MsgFlags};
+use nix::cmsg_space;
 
 use crate::BridgeConfig;
 
-// ─── Server global markers ──────────────────────────────────────────────────
+// ── Wayland wire protocol constants ─────────────────────────────────────────
 
-pub struct CompositorGlobal;
-pub struct SubcompositorGlobal;
-pub struct ShmGlobal;
-pub struct DataDeviceManagerGlobal;
-pub struct SeatGlobal;
-pub struct OutputGlobal;
-pub struct LayerShellGlobal;
-
-pub struct LayerSurfaceData {
-    pub namespace: String,
-    pub layer: u32,
-    pub client_id: ClientId,
-    pub client_layer_surface: Option<client_surface::ZwlrLayerSurfaceV1>,
-    pub client_surface: Option<ClientWlSurface>,
+#[repr(C, packed)]
+struct WlMsgHeader {
+    object_id: u32,
+    opcode_size: u32, // upper 16 = size, lower 16 = opcode
 }
 
-// ─── Bridge state ───────────────────────────────────────────────────────────
-
-pub struct BridgeState {
-    pub layer_surface_count: u64,
-    pub client_conn: Connection,
-    pub client_event_queue: EventQueue<BridgeState>,
-    pub client_compositor: Option<ClientWlCompositor>,
-    pub client_layer_shell: Option<client_shell::ZwlrLayerShellV1>,
-    pub client_outputs: Vec<ClientWlOutput>,
-    pub client_seat: Option<ClientWlSeat>,
-    pub client_registry: Option<ClientWlRegistry>,
+impl WlMsgHeader {
+    fn opcode(&self) -> u16 { (self.opcode_size & 0xffff) as u16 }
+    fn size(&self) -> u16 { (self.opcode_size >> 16) as u16 }
 }
 
-// ═══ Client Dispatch impls (needed by GlobalList::bind) ═════════════════════
+// Standard object IDs
+const WL_DISPLAY_ID: u32 = 1;
+const WL_DISPLAY_ERROR: u16 = 0;
+const WL_DISPLAY_GET_REGISTRY: u16 = 1;
+const WL_REGISTRY_GLOBAL: u16 = 0;
+const WL_REGISTRY_GLOBAL_REMOVE: u16 = 1;
+const WL_REGISTRY_BIND: u16 = 0;
 
-impl Dispatch<ClientWlRegistry, GlobalListContents> for BridgeState {
-    fn event(
-        _state: &mut Self, _registry: &ClientWlRegistry,
-        _event: <ClientWlRegistry as Proxy>::Event, _data: &GlobalListContents,
-        _conn: &Connection, _qh: &QueueHandle<BridgeState>,
-    ) {}
+// ── Proxy state per client connection ──────────────────────────────────────
+
+struct ClientProxy {
+    to_client: UnixStream,
+    to_compositor: UnixStream,
+    running: Arc<AtomicBool>,
 }
 
-impl Dispatch<ClientWlCompositor, ()> for BridgeState {
-    fn event(
-        _state: &mut Self, _proxy: &ClientWlCompositor,
-        _event: <ClientWlCompositor as Proxy>::Event, _data: &(),
-        _conn: &Connection, _qh: &QueueHandle<BridgeState>,
-    ) {}
-}
-
-impl Dispatch<ClientWlOutput, ()> for BridgeState {
-    fn event(
-        _state: &mut Self, _proxy: &ClientWlOutput,
-        _event: <ClientWlOutput as Proxy>::Event, _data: &(),
-        _conn: &Connection, _qh: &QueueHandle<BridgeState>,
-    ) {}
-}
-
-impl Dispatch<ClientWlSeat, ()> for BridgeState {
-    fn event(
-        _state: &mut Self, _proxy: &ClientWlSeat,
-        _event: <ClientWlSeat as Proxy>::Event, _data: &(),
-        _conn: &Connection, _qh: &QueueHandle<BridgeState>,
-    ) {}
-}
-
-impl Dispatch<client_shell::ZwlrLayerShellV1, ()> for BridgeState {
-    fn event(
-        _state: &mut Self, _proxy: &client_shell::ZwlrLayerShellV1,
-        _event: <client_shell::ZwlrLayerShellV1 as Proxy>::Event, _data: &(),
-        _conn: &Connection, _qh: &QueueHandle<BridgeState>,
-    ) {}
-}
-
-impl Dispatch<ClientWlSurface, ()> for BridgeState {
-    fn event(
-        _state: &mut Self, _proxy: &ClientWlSurface,
-        _event: <ClientWlSurface as Proxy>::Event, _data: &(),
-        _conn: &Connection, _qh: &QueueHandle<BridgeState>,
-    ) {}
-}
-
-impl Dispatch<client_surface::ZwlrLayerSurfaceV1, ()> for BridgeState {
-    fn event(
-        _state: &mut Self, _proxy: &client_surface::ZwlrLayerSurfaceV1,
-        _event: <client_surface::ZwlrLayerSurfaceV1 as Proxy>::Event, _data: &(),
-        _conn: &Connection, _qh: &QueueHandle<BridgeState>,
-    ) {}
-}
-
-// ═══ Server GlobalDispatch ══════════════════════════════════════════════════
-
-impl GlobalDispatch<WlCompositor, CompositorGlobal> for BridgeState {
-    fn bind(
-        _s: &mut Self, _dh: &DisplayHandle, _c: &Client, r: wayland_server::New<WlCompositor>,
-        _d: &CompositorGlobal, init: &mut DataInit<'_, Self>,
-    ) { info!("[sv] wl_compositor v5"); init.init(r, ()); }
-}
-
-impl GlobalDispatch<WlSubcompositor, SubcompositorGlobal> for BridgeState {
-    fn bind(
-        _s: &mut Self, _dh: &DisplayHandle, _c: &Client, r: wayland_server::New<WlSubcompositor>,
-        _d: &SubcompositorGlobal, init: &mut DataInit<'_, Self>,
-    ) { info!("[sv] wl_subcompositor v1"); init.init(r, ()); }
-}
-
-impl GlobalDispatch<WlShm, ShmGlobal> for BridgeState {
-    fn bind(
-        _s: &mut Self, _dh: &DisplayHandle, _c: &Client, r: wayland_server::New<WlShm>,
-        _d: &ShmGlobal, init: &mut DataInit<'_, Self>,
-    ) { info!("[sv] wl_shm v1"); init.init(r, ()); }
-}
-
-impl GlobalDispatch<WlDataDeviceManager, DataDeviceManagerGlobal> for BridgeState {
-    fn bind(
-        _s: &mut Self, _dh: &DisplayHandle, _c: &Client, r: wayland_server::New<WlDataDeviceManager>,
-        _d: &DataDeviceManagerGlobal, init: &mut DataInit<'_, Self>,
-    ) { info!("[sv] wl_data_device_manager v3"); init.init(r, ()); }
-}
-
-impl GlobalDispatch<WlSeat, SeatGlobal> for BridgeState {
-    fn bind(
-        _s: &mut Self, _dh: &DisplayHandle, _c: &Client, r: wayland_server::New<WlSeat>,
-        _d: &SeatGlobal, init: &mut DataInit<'_, Self>,
-    ) { info!("[sv] wl_seat v8"); init.init(r, ()); }
-}
-
-impl GlobalDispatch<WlOutput, OutputGlobal> for BridgeState {
-    fn bind(
-        _s: &mut Self, _dh: &DisplayHandle, _c: &Client, r: wayland_server::New<WlOutput>,
-        _d: &OutputGlobal, init: &mut DataInit<'_, Self>,
-    ) {
-        info!("[sv] wl_output v4");
-        use wayland_server::protocol::wl_output::{Mode, Subpixel, Transform};
-        let o = init.init(r, ());
-        o.geometry(0, 0, 350, 200, Subpixel::Unknown,
-            "unknown".to_string(), "unknown".to_string(), Transform::Normal);
-        o.mode(Mode::Current | Mode::Preferred, 1920, 1080, 60000);
-        o.scale(1);
-        o.name("eDP-1".to_string());
-        o.description("Dummy bridge output".to_string());
-        o.done();
+impl ClientProxy {
+    fn new(to_client: UnixStream, to_compositor: UnixStream, running: Arc<AtomicBool>) -> Self {
+        Self { to_client, to_compositor, running }
     }
-}
 
-impl GlobalDispatch<server_shell::ZwlrLayerShellV1, LayerShellGlobal> for BridgeState {
-    fn bind(
-        _s: &mut Self, _dh: &DisplayHandle, _c: &Client,
-        r: wayland_server::New<server_shell::ZwlrLayerShellV1>,
-        _d: &LayerShellGlobal, init: &mut DataInit<'_, Self>,
-    ) { info!("[sv] zwlr_layer_shell_v1 v4"); init.init(r, LayerShellGlobal); }
-}
-
-// ═══ Server Dispatch for protocol requests ══════════════════════════════════
-
-impl wayland_server::Dispatch<WlCompositor, ()> for BridgeState {
-    fn request(
-        _s: &mut Self, _c: &Client, _r: &WlCompositor,
-        req: <WlCompositor as Resource>::Request, _d: &(), _dh: &DisplayHandle,
-        init: &mut wayland_server::DataInit<'_, Self>,
-    ) {
-        match req {
-            wayland_server::protocol::wl_compositor::Request::CreateSurface { id } => { init.init(id, ()); }
-            wayland_server::protocol::wl_compositor::Request::CreateRegion { id } => { init.init(id, ()); }
-            _ => {}
-        }
-    }
-}
-
-impl wayland_server::Dispatch<WlRegion, ()> for BridgeState {
-    fn request(
-        _s: &mut Self, _c: &Client, _r: &WlRegion,
-        _req: <WlRegion as Resource>::Request, _d: &(), _dh: &DisplayHandle,
-        _init: &mut wayland_server::DataInit<'_, Self>,
-    ) {}
-}
-
-impl wayland_server::Dispatch<WlSubcompositor, ()> for BridgeState {
-    fn request(
-        _s: &mut Self, _c: &Client, _r: &WlSubcompositor,
-        _req: <WlSubcompositor as Resource>::Request, _d: &(), _dh: &DisplayHandle,
-        _init: &mut wayland_server::DataInit<'_, Self>,
-    ) {}
-}
-
-impl wayland_server::Dispatch<WlShm, ()> for BridgeState {
-    fn request(
-        _s: &mut Self, _c: &Client, _r: &WlShm,
-        _req: <WlShm as Resource>::Request, _d: &(), _dh: &DisplayHandle,
-        _init: &mut wayland_server::DataInit<'_, Self>,
-    ) {}
-}
-
-impl wayland_server::Dispatch<WlDataDeviceManager, ()> for BridgeState {
-    fn request(
-        _s: &mut Self, _c: &Client, _r: &WlDataDeviceManager,
-        _req: <WlDataDeviceManager as Resource>::Request, _d: &(), _dh: &DisplayHandle,
-        _init: &mut wayland_server::DataInit<'_, Self>,
-    ) {}
-}
-
-impl wayland_server::Dispatch<WlSeat, ()> for BridgeState {
-    fn request(
-        _s: &mut Self, _c: &Client, _r: &WlSeat,
-        _req: <WlSeat as Resource>::Request, _d: &(), _dh: &DisplayHandle,
-        _init: &mut wayland_server::DataInit<'_, Self>,
-    ) {}
-}
-
-impl wayland_server::Dispatch<WlOutput, ()> for BridgeState {
-    fn request(
-        _s: &mut Self, _c: &Client, _r: &WlOutput,
-        _req: <WlOutput as Resource>::Request, _d: &(), _dh: &DisplayHandle,
-        _init: &mut wayland_server::DataInit<'_, Self>,
-    ) {}
-}
-
-impl wayland_server::Dispatch<WlSurface, ()> for BridgeState {
-    fn request(
-        _s: &mut Self, _c: &Client, _r: &WlSurface,
-        _req: <WlSurface as Resource>::Request, _d: &(), _dh: &DisplayHandle,
-        _init: &mut wayland_server::DataInit<'_, Self>,
-    ) {}
-}
-
-// ═══ Forwarding ObjectData (no events expected from Mutter) ═════════════════
-
-struct FwdObjectData;
-impl wayland_client::backend::ObjectData for FwdObjectData {
-    fn event(
-        self: Arc<Self>,
-        _backend: &wayland_client::backend::Backend,
-        _msg: wayland_client::backend::protocol::Message<
-            wayland_backend::client::ObjectId, std::os::unix::io::OwnedFd,
-        >,
-    ) -> Option<Arc<dyn wayland_client::backend::ObjectData>> { None }
-    fn destroyed(&self, _id: wayland_backend::client::ObjectId) {}
-    fn debug(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("FwdObjectData")
-    }
-}
-
-// ═══ Server-side zwlr_layer_shell_v1 dispatch → forward to Mutter ═══
-
-impl wayland_server::Dispatch<server_shell::ZwlrLayerShellV1, LayerShellGlobal> for BridgeState {
-    fn request(
-        state: &mut Self, _client: &Client, _resource: &server_shell::ZwlrLayerShellV1,
-        request: <server_shell::ZwlrLayerShellV1 as Resource>::Request,
-        _data: &LayerShellGlobal, _dh: &DisplayHandle, init: &mut wayland_server::DataInit<'_, Self>,
-    ) {
-        match request {
-            server_shell::Request::GetLayerSurface {
-                id, surface: _server_surface, output: _output, layer, namespace,
-            } => {
-                state.layer_surface_count += 1;
-                let n = state.layer_surface_count;
-                let layer_val: u32 = layer.clone().into();
-                info!("⭐ get_layer_surface #{}: layer={}, namespace='{}'", n, layer_val, namespace);
-
-                if let (Some(compositor), Some(layer_shell)) =
-                    (state.client_compositor.as_ref(), state.client_layer_shell.as_ref())
-                {
-                    // 1) Create client-side wl_surface
-                    let client_surf: Result<ClientWlSurface, _> = compositor.send_constructor(
-                        wayland_client::protocol::wl_compositor::Request::CreateSurface {},
-                        Arc::new(FwdObjectData) as Arc<dyn wayland_client::backend::ObjectData>,
-                    );
-                    match client_surf {
-                        Ok(client_surf) => {
-                            info!("  ✅ Created wl_surface on Mutter");
-
-                            // Convert server Layer → client Layer via raw value
-                            let client_layer = match layer_val {
-                                0 => WEnum::Value(client_shell::Layer::Background),
-                                1 => WEnum::Value(client_shell::Layer::Bottom),
-                                2 => WEnum::Value(client_shell::Layer::Top),
-                                _ => WEnum::Value(client_shell::Layer::Overlay),
-                            };
-
-                            let client_lsurf: Result<client_surface::ZwlrLayerSurfaceV1, _> = layer_shell.send_constructor(
-                                client_shell::Request::GetLayerSurface {
-                                    surface: client_surf.clone(),
-                                    output: state.client_outputs.first().cloned(),
-                                    layer: client_layer,
-                                    namespace: namespace.clone(),
-                                },
-                                Arc::new(FwdObjectData) as Arc<dyn wayland_client::backend::ObjectData>,
-                            );
-
-                            match client_lsurf {
-                                Ok(client_lsurface) => {
-                                    info!("  ✅ Created layer surface on Mutter!");
-                                    let lsd = LayerSurfaceData {
-                                        namespace: namespace.to_string(), layer: layer_val,
-                                        client_id: _client.id(),
-                                        client_layer_surface: Some(client_lsurface),
-                                        client_surface: Some(client_surf),
-                                    };
-                                    let srv = init.init(id, lsd);
-                                    srv.configure(0, 0, 1);
-                                    info!("  ↪ configured + linked!");
-                                }
-                                Err(e) => {
-                                    warn!("  ⚠ client layer surf: {e}");
-                                    let lsd = LayerSurfaceData {
-                                        namespace: namespace.to_string(), layer: layer_val,
-                                        client_id: _client.id(), client_layer_surface: None,
-                                        client_surface: None,
-                                    };
-                                    let srv = init.init(id, lsd);
-                                    srv.configure(0, 0, 1);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("  ⚠ client wl_surface: {e}");
-                            let lsd = LayerSurfaceData {
-                                namespace: namespace.to_string(), layer: layer_val,
-                                client_id: _client.id(), client_layer_surface: None,
-                                client_surface: None,
-                            };
-                            let srv = init.init(id, lsd);
-                            srv.configure(0, 0, 1);
-                        }
-                    }
-                } else {
-                    warn!("  ⚠ No Mutter: comp={}, ls={}",
-                        state.client_compositor.is_some(), state.client_layer_shell.is_some());
-                    let lsd = LayerSurfaceData {
-                        namespace: namespace.to_string(), layer: layer_val,
-                        client_id: _client.id(), client_layer_surface: None,
-                        client_surface: None,
-                    };
-                    let srv = init.init(id, lsd);
-                    srv.configure(0, 0, 1);
-                }
+    /// Read one raw Wayland message from a stream, returning (header, raw_data, fds).
+    fn read_msg(stream: &UnixStream) -> Result<Option<(WlMsgHeader, Vec<u8>, Vec<OwnedFd>)>> {
+        let mut header_buf = [0u8; 8];
+        let mut n = 0;
+        while n < 8 {
+            match stream.read_at_nonblocking(&mut header_buf[n..])? {
+                0 if n == 0 => return Ok(None), // EOF / would block
+                0 => bail!("Short header read"),
+                Some(s) => n += s,
+                None => { /* would block */ return Ok(None); }
             }
-            server_shell::Request::Destroy { .. } => info!("zwlr_layer_shell_v1.destroy"),
-            _ => warn!("Unhandled layer_shell request"),
         }
+        let header: &WlMsgHeader = unsafe { &*(header_buf.as_ptr() as *const WlMsgHeader) };
+        let total_size = header.size() as usize;
+        if total_size < 8 {
+            bail!("Message size too small: {}", total_size);
+        }
+        let payload_size = total_size - 8;
+        let mut payload = vec![0u8; payload_size];
+        n = 0;
+        while n < payload_size {
+            match stream.read_at_nonblocking(&mut payload[n..])? {
+                0 => bail!("Short payload read"),
+                Some(s) => n += s,
+                None => bail!("Would block mid-payload"),
+            }
+        }
+
+        // Read any attached FDs via SCM_RIGHTS
+        let fds = recv_fds(stream.as_raw_fd())?;
+
+        Ok(Some((*header, payload, fds)))
     }
-}
 
-// ═══ Server-side zwlr_layer_surface_v1 → forward to Mutter ═══
+    fn write_raw(stream: &UnixStream, header: &WlMsgHeader, payload: &[u8], fds: &[OwnedFd]) -> Result<()> {
+        let hdr_bytes = unsafe {
+            std::slice::from_raw_parts(
+                header as *const WlMsgHeader as *const u8,
+                std::mem::size_of::<WlMsgHeader>(),
+            )
+        };
+        let mut iov = [
+            libc::iovec { iov_base: hdr_bytes.as_ptr() as *mut libc::c_void, iov_len: hdr_bytes.len() },
+            libc::iovec { iov_base: payload.as_ptr() as *mut libc::c_void, iov_len: payload.len() },
+        ];
 
-impl wayland_server::Dispatch<server_surface::ZwlrLayerSurfaceV1, LayerSurfaceData> for BridgeState {
-    fn request(
-        state: &mut Self, _client: &Client, _resource: &server_surface::ZwlrLayerSurfaceV1,
-        request: <server_surface::ZwlrLayerSurfaceV1 as Resource>::Request,
-        data: &LayerSurfaceData, _dh: &DisplayHandle, _init: &mut wayland_server::DataInit<'_, Self>,
-    ) {
-        let n = state.layer_surface_count;
-
-        // Helper: forward request to client-side (Mutter) surface
-        // Use send_request for non-constructor requests (SetSize, Destroy, etc.)
-        let fwd = |req: client_surface::Request| {
-            if let Some(ref cl) = data.client_layer_surface {
-                let _: Result<(), _> = cl.send_request(req);
+        let mut cmsg_buf = vec![0u8; libc::CMSG_SPACE((fds.len() * std::mem::size_of::<RawFd>()) as _) as _];
+        let mut cmsg = unsafe {
+            libc::msghdr {
+                msg_name: std::ptr::null_mut(),
+                msg_namelen: 0,
+                msg_iov: iov.as_mut_ptr(),
+                msg_iovlen: iov.len() as _,
+                msg_control: cmsg_buf.as_mut_ptr() as *mut _,
+                msg_controllen: cmsg_buf.len() as _,
+                msg_flags: 0,
             }
         };
 
-        match request {
-            server_surface::Request::SetSize { width, height } => {
-                info!("  #{} set_size({}×{})", n, width, height);
-                fwd(client_surface::Request::SetSize { width, height });
-            }
-            server_surface::Request::SetAnchor { anchor } => {
-                match anchor {
-                    WEnum::Value(a) => {
-                        let raw: u32 = a.into();
-                        info!("  #{} set_anchor(0x{:x})", n, raw);
-                        // Forward as raw value to avoid type mismatch between server/client Anchor
-                        fwd(client_surface::Request::SetAnchor {
-                            anchor: WEnum::Unknown(raw),
-                        });
-                    }
-                    WEnum::Unknown(v) => {
-                        info!("  #{} set_anchor(unknown {})", n, v);
-                        fwd(client_surface::Request::SetAnchor {
-                            anchor: WEnum::Unknown(v),
-                        });
-                    }
+        if !fds.is_empty() {
+            let fd_raws: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+            let cmsg_hdr = unsafe {
+                libc::CMSG_FIRSTHDR(&cmsg)
+            };
+            if let Some(hdr) = cmsg_hdr.as_mut() {
+                hdr.cmsg_level = libc::SOL_SOCKET;
+                hdr.cmsg_type = libc::SCM_RIGHTS;
+                hdr.cmsg_len = libc::CMSG_LEN((fd_raws.len() * std::mem::size_of::<RawFd>()) as _) as _;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        fd_raws.as_ptr(),
+                        libc::CMSG_DATA(hdr) as *mut RawFd,
+                        fd_raws.len(),
+                    );
                 }
             }
-            server_surface::Request::SetExclusiveZone { zone } => {
-                info!("  #{} set_exclusive_zone({})", n, zone);
-                fwd(client_surface::Request::SetExclusiveZone { zone });
-            }
-            server_surface::Request::SetMargin { top, right, bottom, left } => {
-                info!("  #{} set_margin({},{},{},{})", n, top, right, bottom, left);
-                fwd(client_surface::Request::SetMargin { top, right, bottom, left });
-            }
-            server_surface::Request::SetKeyboardInteractivity { keyboard_interactivity } => {
-                match keyboard_interactivity {
-                    WEnum::Value(ki) => {
-                        let raw: u32 = ki.into();
-                        info!("  #{} set_keyboard_interactivity({})", n, raw);
-                        fwd(client_surface::Request::SetKeyboardInteractivity {
-                            keyboard_interactivity: WEnum::Unknown(raw),
-                        });
-                    }
-                    WEnum::Unknown(v) => {
-                        info!("  #{} set_keyboard_interactivity(unknown {})", n, v);
-                        fwd(client_surface::Request::SetKeyboardInteractivity {
-                            keyboard_interactivity: WEnum::Unknown(v),
-                        });
-                    }
-                }
-            }
-            server_surface::Request::GetPopup { popup: _, .. } => {
-                info!("  #{} get_popup (NYI)", n);
-            }
-            server_surface::Request::AckConfigure { serial } => {
-                info!("  #{} ack_configure({})", n, serial);
-                fwd(client_surface::Request::AckConfigure { serial });
-            }
-            server_surface::Request::Destroy { .. } => {
-                info!("  #{} destroy", n);
-                fwd(client_surface::Request::Destroy {});
-            }
-            _ => warn!("Unhandled layer_surface request"),
+        } else {
+            cmsg.msg_control = std::ptr::null_mut();
+            cmsg.msg_controllen = 0;
         }
+
+        unsafe {
+            if libc::sendmsg(stream.as_raw_fd(), &cmsg, libc::MSG_NOSIGNAL) < 0 {
+                bail!("sendmsg failed: {}", std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 }
 
-// ─── Event loop ─────────────────────────────────────────────────────────────
+fn recv_fds(fd: RawFd) -> Result<Vec<OwnedFd>> {
+    let mut cmsg_space = cmsg_space!(RawFd, 4);
+    let mut buf = [0u8; 1];
+    let msg = recvmsg(
+        fd,
+        &[libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut _,
+            iov_len: 0, // peek only
+        }],
+        Some(&mut cmsg_space),
+        MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_PEEK,
+    )?;
 
-pub fn run_event_loop(
-    mut display: Display<BridgeState>,
-    socket: ListeningSocket,
-    _config: Arc<BridgeConfig>,
-) -> Result<()> {
-    info!("Connecting to Mutter on '{}'...", _config.compositor_display);
-
-    let prev = std::env::var("WAYLAND_DISPLAY").ok();
-    std::env::set_var("WAYLAND_DISPLAY", &_config.compositor_display);
-    let conn = Connection::connect_to_env().context("Failed connect to Mutter")?;
-    if let Some(p) = prev { std::env::set_var("WAYLAND_DISPLAY", p); }
-    else { std::env::remove_var("WAYLAND_DISPLAY"); }
-
-    let (globals, client_queue) = registry_queue_init::<BridgeState>(&conn)
-        .context("Failed registry init")?;
-    let qh = client_queue.handle();
-
-    // Bind Mutter globals via GlobalList (needs Dispatch<I,()> impls)
-    let c_compositor: Option<ClientWlCompositor> = globals.bind(&qh, 1..=5, ()).ok();
-    let c_layer_shell: Option<client_shell::ZwlrLayerShellV1> = globals.bind(&qh, 1..=4, ()).ok();
-    let c_seat: Option<ClientWlSeat> = globals.bind(&qh, 1..=8, ()).ok();
-    let c_outputs: Vec<ClientWlOutput> = globals.bind(&qh, 1..=4, ()).ok()
-        .map(|o: ClientWlOutput| vec![o]).unwrap_or_default();
-
-    // Get registry for potential use
-    info!("Mutter: compositor={}, layer_shell={}, outputs={}, seat={}",
-        c_compositor.is_some(), c_layer_shell.is_some(), c_outputs.len(), c_seat.is_some());
-
-    // ── Register server globals ──
-    let dh = display.handle();
-    dh.create_global::<BridgeState, WlCompositor, CompositorGlobal>(5, CompositorGlobal);
-    dh.create_global::<BridgeState, WlSubcompositor, SubcompositorGlobal>(1, SubcompositorGlobal);
-    dh.create_global::<BridgeState, WlShm, ShmGlobal>(1, ShmGlobal);
-    dh.create_global::<BridgeState, WlDataDeviceManager, DataDeviceManagerGlobal>(3, DataDeviceManagerGlobal);
-    dh.create_global::<BridgeState, WlSeat, SeatGlobal>(8, SeatGlobal);
-    dh.create_global::<BridgeState, WlOutput, OutputGlobal>(4, OutputGlobal);
-    dh.create_global::<BridgeState, server_shell::ZwlrLayerShellV1, LayerShellGlobal>(4, LayerShellGlobal);
-    info!("[sv] 7 globals registered");
-
-    display.flush_clients()?;
-
-    let mut state = Box::new(BridgeState {
-        layer_surface_count: 0,
-        client_conn: conn,
-        client_event_queue: client_queue,
-        client_compositor: c_compositor,
-        client_layer_shell: c_layer_shell,
-        client_outputs: c_outputs,
-        client_seat: c_seat,
-        client_registry: None,
-    });
-
-    // Borrow-checking workaround: extract raw pointers for disjoint fields
-    let event_queue_ptr: *mut EventQueue<BridgeState> = &mut state.client_event_queue;
-    let conn_ptr: *mut Connection = &mut state.client_conn;
-
-    // Initial roundtrip to complete Mutter protocol handshake
-    unsafe {
-        if let Err(e) = (*event_queue_ptr).roundtrip(&mut *state) {
-            error!("Roundtrip: {e}");
-        }
-    }
-
-    info!("⏳ Bridge Phase 3b running. Accepting clients and proxying to Mutter...");
-
-    loop {
-        match socket.accept() {
-            Ok(Some(stream)) => {
-                info!("[sv] New client");
-                if let Err(e) = display.handle().insert_client(
-                    stream, Arc::new(BridgeClientData) as Arc<dyn ClientData>,
-                ) {
-                    error!("[sv] Insert: {e}");
+    let mut fds = Vec::new();
+    for cmsg in msg.cmsgs() {
+        if let ControlMessageOwned::ScmRights(fds_slice) = cmsg {
+            for &raw_fd in fds_slice {
+                if raw_fd >= 0 {
+                    fds.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
                 }
             }
-            Ok(None) => {}
-            Err(e) => { error!("[sv] Accept: {e}"); break; }
         }
+    }
+    Ok(fds)
+}
 
-        if let Err(e) = display.dispatch_clients(&mut *state) { error!("[sv] Dispatch: {e}"); break; }
-        if let Err(e) = display.flush_clients() { error!("[sv] Flush: {e}"); break; }
-        unsafe {
-            if let Err(e) = (*event_queue_ptr).dispatch_pending(&mut *state) { error!("[cl] Dispatch: {e}"); break; }
-            if let Err(e) = (*conn_ptr).flush() { error!("[cl] Flush: {e}"); break; }
+// ── Layer-shell interception state ──────────────────────────────────────────
+
+struct ObjectMap {
+    /// Maps server-assigned object IDs to their interpretation.
+    /// None = passthrough, Some(name) = intercepted layer-shell.
+    objects: Vec<Option<ObjectKind>>,
+    /// The wl_registry object ID (assigned when we spoof it).
+    registry_id: u32,
+    /// Next object ID to assign for intercepted objects.
+}
+
+#[derive(Clone, Debug)]
+enum ObjectKind {
+    Registry,
+    LayerShell,
+    LayerSurface,
+}
+
+// ── Main proxy loop ─────────────────────────────────────────────────────────
+
+pub fn run_proxy_loop(config: Arc<BridgeConfig>) -> Result<()> {
+    let socket_path = config.socket_path();
+    let compositor_display = &config.compositor_display;
+
+    // Remove old socket
+    let _ = std::fs::remove_file(&socket_path);
+    let listen_socket = std::os::unix::net::UnixListener::bind(&socket_path)
+        .context("Failed to bind listener socket")?;
+    // Set permissions
+    std::fs::set_permissions(&socket_path, std::os::unix::fs::PermissionsExt::from_mode(0o777))?;
+    info!("Listening on {socket_path}, proxying to {compositor_display}");
+
+    for stream in listen_socket.incoming() {
+        let client = stream.context("Accept failed")?;
+        client.set_nonblocking(true)?;
+
+        // Connect to real compositor
+        let compositor_socket = std::path::Path::new("/run/user/1000")
+            .join(compositor_display);
+        let compositor = UnixStream::connect(&compositor_socket)
+            .context("Failed to connect to compositor")?;
+        compositor.set_nonblocking(true)?;
+
+        info!("New client connected, proxying to {compositor_display}");
+        let running = Arc::new(AtomicBool::new(true));
+        let proxy = Arc::new(ClientProxy::new(client, compositor, running.clone()));
+
+        // Run the bidirectional proxy
+        if let Err(e) = run_client_loop(proxy.clone()) {
+            error!("Client loop error: {e}");
         }
-
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    info!("Event loop exited");
     Ok(())
 }
 
-struct BridgeClientData;
-impl ClientData for BridgeClientData {
-    fn initialized(&self, id: ClientId) { info!("[sv] Client init (id={:?})", id); }
-    fn disconnected(&self, id: ClientId, _r: DisconnectReason) { info!("[sv] Client disc (id={:?})", id); }
+fn run_client_loop(proxy: Arc<ClientProxy>) -> Result<()> {
+    let mut object_map = ObjectMap {
+        objects: vec![None; 256], // pre-allocate space for up to 256 object IDs
+        registry_id: 0,
+    };
+
+    // Phase 1: Initial handshake (client sends get_registry)
+    // We need to intercept this to inject our zwlr_layer_shell_v1 global.
+
+    loop {
+        // Read from client → compositor
+        let msg = ClientProxy::read_msg(&proxy.to_client)?;
+        if let Some((header, payload, fds)) = msg {
+            if header.object_id == WL_DISPLAY_ID && header.opcode() == WL_DISPLAY_GET_REGISTRY {
+                // INTERCEPT: forward but track the registry ID
+                // The payload of get_registry is the new_id (registry object)
+                let registry_id = parse_new_id(&payload)?;
+                info!("Client get_registry → id={}", registry_id);
+                object_map.registry_id = registry_id;
+                object_map.ensure_capacity(registry_id as usize);
+                object_map.objects[registry_id as usize] = Some(ObjectKind::Registry);
+
+                // Forward to compositor
+                ClientProxy::write_raw(&proxy.to_compositor, &header, &payload, &fds)?;
+            } else if object_map.objects.get(header.object_id as usize)
+                .and_then(|o| o.as_ref())
+                .map_or(true, |k| !matches!(k, ObjectKind::Registry))
+            {
+                // Not a registry object → passthrough
+                ClientProxy::write_raw(&proxy.to_compositor, &header, &payload, &fds)?;
+            } else {
+                // Registry request → intercept
+                intercept_registry_request(&proxy, &mut object_map, &header, &payload, &fds)?;
+            }
+        }
+
+        // Read from compositor → client
+        let msg = ClientProxy::read_msg(&proxy.to_compositor)?;
+        if let Some((header, payload, fds)) = msg {
+            // Check if this is a compositor event to our intercepted objects
+            if object_map.objects.get(header.object_id as usize)
+                .and_then(|o| o.as_ref())
+                .map_or(false, |k| matches!(k, ObjectKind::Registry))
+            {
+                // Registry event → we may need to inject zwlr_layer_shell_v1
+                intercept_registry_event(&proxy, &mut object_map, &header, &payload, &fds)?;
+            } else {
+                // Passthrough
+                ClientProxy::write_raw(&proxy.to_client, &header, &payload, &fds)?;
+            }
+        }
+
+        // TODO: handle would-block with select/poll/epoll
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+fn parse_new_id(payload: &[u8]) -> Result<u32> {
+    if payload.len() < 4 {
+        bail!("Payload too short for new_id");
+    }
+    let id = u32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    Ok(id)
+}
+
+fn ensure_capacity(self: &mut ObjectMap, idx: usize) {
+    if idx >= self.objects.len() {
+        self.objects.resize(idx + 256, None);
+    }
+}
+
+fn intercept_registry_request(
+    proxy: &ClientProxy,
+    object_map: &mut ObjectMap,
+    header: &WlMsgHeader,
+    payload: &[u8],
+    fds: &[OwnedFd],
+) -> Result<()> {
+    let opcode = header.opcode();
+    match opcode {
+        WL_REGISTRY_BIND => {
+            // wl_registry.bind(name, id, interface, version)
+            // Parse: name(u32), new_id(u32), interface_string, version(u32)
+            if payload.len() < 8 {
+                bail!("Short bind payload");
+            }
+            let _name = u32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let id = u32::from_ne_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            // string starts at byte 8
+            let interface = parse_string_at(payload, 8)?;
+
+            info!("  bind object_id={}, interface='{}'", id, interface);
+
+            if interface == "zwlr_layer_shell_v1" {
+                // Intercept! Track this object
+                object_map.ensure_capacity(id as usize);
+                object_map.objects[id as usize] = Some(ObjectKind::LayerShell);
+                info!("  ↪ Intercepted layer shell v1 (id={})", id);
+
+                // DON'T forward to compositor (we handle it ourselves)
+                // But we need to send the registry.bind to compositor with different args?
+                // Actually, the compositor doesn't know about zwlr_layer_shell...
+                // For now, just swallow it.
+                Ok(())
+            } else {
+                // Forward to compositor
+                ClientProxy::write_raw(&proxy.to_compositor, &header, &payload, &fds)
+            }
+        }
+        _ => {
+            ClientProxy::write_raw(&proxy.to_compositor, &header, &payload, &fds)
+        }
+    }
+}
+
+fn intercept_registry_event(
+    proxy: &ClientProxy,
+    object_map: &mut ObjectMap,
+    header: &WlMsgHeader,
+    payload: &[u8],
+    fds: &[OwnedFd],
+) -> Result<()> {
+    let opcode = header.opcode();
+    match opcode {
+        WL_REGISTRY_GLOBAL => {
+            // wl_registry.global(name, interface, version)
+            let _name = u32::from_ne_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let interface = parse_string_at(payload, 4)?;
+            info!("  global: '{}'", interface);
+
+            // Forward all globals as-is
+            ClientProxy::write_raw(&proxy.to_client, &header, &payload, &fds)?;
+
+            // After each global from compositor, inject our zwlr_layer_shell_v1 global
+            if interface == "wl_output" {
+                info!("  ↪ Injecting zwlr_layer_shell_v1 after output");
+                // Send fake global event: name=999, interface="zwlr_layer_shell_v1", version=4
+                inject_fake_global(proxy, object_map, 999u32)?;
+            }
+        }
+        _ => {
+            ClientProxy::write_raw(&proxy.to_client, &header, &payload, &fds)?;
+        }
+    }
+    Ok(())
+}
+
+fn inject_fake_global(proxy: &ClientProxy, object_map: &mut ObjectMap, name: u32) -> Result<()> {
+    let interface = "zwlr_layer_shell_v1\0";
+    let version: u32 = 4;
+
+    // Build payload: name(u32) + string_header(u32=len+flags) + string_data + padding + version(u32)
+    let str_len = interface.len() as u32; // includes null terminator
+    let str_header = str_len; // no flags (MSB clear)
+
+    let padded_len = align4(interface.len());
+    let mut payload = Vec::with_capacity(4 + 4 + padded_len + 4);
+    payload.extend_from_slice(&name.to_ne_bytes());
+    payload.extend_from_slice(&str_header.to_ne_bytes());
+    payload.extend_from_slice(interface.as_bytes());
+    while payload.len() % 4 != 0 { payload.push(0); }
+    payload.extend_from_slice(&version.to_ne_bytes());
+
+    let obj_id = object_map.registry_id;
+    let total_size = (8 + payload.len()) as u16;
+    let opcode_size = (total_size as u32) << 16 | WL_REGISTRY_GLOBAL as u32;
+    let hdr = WlMsgHeader { object_id: obj_id, opcode_size };
+
+    ClientProxy::write_raw(&proxy.to_client, &hdr, &payload, &[])?;
+    Ok(())
+}
+
+fn parse_string_at(data: &[u8], offset: usize) -> Result<String> {
+    if offset + 4 > data.len() {
+        bail!("Offset beyond data");
+    }
+    let len = u32::from_ne_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+    let has_flag = (len & 0x80000000) != 0;
+    let str_len = (len & 0x7fffffff) as usize;
+    if str_len == 0 {
+        return Ok(String::new());
+    }
+    let data_start = offset + 4;
+    if data_start + str_len - 1 > data.len() {
+        bail!("String extends beyond data");
+    }
+    // String is null-terminated; exclude the null byte
+    let str_bytes = &data[data_start..data_start + str_len - 1];
+    Ok(String::from_utf8_lossy(str_bytes).to_string())
+}
+
+fn align4(n: usize) -> usize {
+    (n + 3) & !3
 }
