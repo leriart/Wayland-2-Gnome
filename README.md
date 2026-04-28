@@ -1,5 +1,10 @@
 # Wayland 2 GNOME
-
+<p align="center">
+  <img src="https://img.shields.io/badge/Rust-1.70%2B-orange.svg" alt="Rust">
+  <a href="https://discord.gg/ehQYYW36Up">
+    <img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?logo=discord&logoColor=white" alt="Discord">
+  </a>
+</p>
 A protocol translation proxy that bridges wlr-layer-shell applications and GNOME Shell. It translates incompatible Wayland protocols into standard XDG surfaces in real time, letting apps built for tiling window managers run natively on GNOME.
 
 ---
