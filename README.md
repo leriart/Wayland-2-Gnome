@@ -335,13 +335,6 @@ src/
   main.rs              -- Entry point, CLI argument parsing, daemon/service setup
 ```
 
-### Code Quality
-
-- All warnings are eliminated (`cargo check` produces zero warnings).
-- `#[allow(dead_code)]` attributes are used sparingly for future-proofing (reserved struct fields).
-
----
-
 ## License
 
 MIT
