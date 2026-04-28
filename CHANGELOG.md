@@ -5,6 +5,12 @@ All notable changes to Wayland 2 GNOME are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] — 2026-04-28
+
+### Fixed
+- Added `--compositor` CLI flag to allow specifying the compositor display name
+  (previously hardcoded to `wayland-0`).
+
 ## [0.1.0] — 2026-04-28
 
 ### Added
@@ -19,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - calloop-based event loop replacing raw libc::poll for session dispatch.
 - Graceful shutdown via LoopSignal (EOF on client/compositor disconnect).
 - End-to-end integration tests with a mock compositor over raw Unix sockets.
-- CLI flags: `--bridge-display`, `--compositor-display`, `--max-clients`, `--log-level`, `--config`, `--pid-file`, `--daemon`.
+- CLI flags: `--socket`, `--compositor`, `--max-clients`, `--log-level`, `--config`, `--pid-file`, `--daemon`.
 
 ### Changed
 - Session loop migrated from `libc::poll` to `calloop::EventLoop` with `Generic<UnixStream>` sources.

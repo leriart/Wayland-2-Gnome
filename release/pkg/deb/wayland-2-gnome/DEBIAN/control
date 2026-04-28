@@ -1,0 +1,10 @@
+Package: wayland-2-gnome
+Version: 0.1.1
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Leriart <leriart@users.noreply.github.com>
+Description: Protocol-aware Wayland proxy translating wlr-layer-shell to GNOME Shell overlays
+ Translates wlr-layer-shell protocol calls (used by Waybar, Rofi,
+ nwg-dock) into standard XDG surfaces that GNOME Shell understands.
+Depends: libc6 (>= 2.35)
