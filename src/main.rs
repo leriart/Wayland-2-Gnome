@@ -114,20 +114,37 @@ fn install_systemd_user_service(socket: &str, compositor: &str, config_path: Opt
     let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
     let systemd_dir = format!("{home}/.config/systemd/user");
     let service_path = format!("{systemd_dir}/wayland-2-gnome.service");
+    let local_bin_dir = format!("{home}/.local/bin");
+    let target_bin = format!("{local_bin_dir}/wayland-2-gnome");
+
+    // Determine where our own binary is running from
+    let self_path = std::env::current_exe()
+        .expect("failed to get current executable path");
+
+    // Create ~/.local/bin if needed
+    std::fs::create_dir_all(&local_bin_dir)?;
+
+    // Copy the binary to ~/.local/bin (overwrite if exists)
+    std::fs::copy(&self_path, &target_bin)?;
+    // Make sure it's executable
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&target_bin, std::fs::Permissions::from_mode(0o755))?;
+
+    eprintln!("  [1/5] Installed binary to {target_bin}");
 
     std::fs::create_dir_all(&systemd_dir)?;
-    eprintln!("  [1/4] Created {systemd_dir}");
+    eprintln!("  [2/5] Created {systemd_dir}");
 
     let service_content = format!(
         r###"[Unit]
 Description=Wayland 2 GNOME protocol bridge (wlr-layer-shell -> GNOME)
-Documentation=https://github.com/SrGcorp/Wayland-2-Gnome
+Documentation=https://github.com/leriart/Wayland-2-Gnome
 After=graphical-session.target
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/wayland-2-gnome --socket {socket} --compositor {compositor}{config_opt}
+ExecStart=%h/.local/bin/wayland-2-gnome --socket {socket} --compositor {compositor}{config_opt}
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
@@ -141,7 +158,7 @@ WantedBy=graphical-session.target
     );
 
     std::fs::write(&service_path, service_content)?;
-    eprintln!("  [2/4] Wrote {service_path}");
+    eprintln!("  [3/5] Wrote {service_path}");
 
     let status = std::process::Command::new("systemctl")
         .args(["--user", "daemon-reload"])
@@ -149,7 +166,7 @@ WantedBy=graphical-session.target
     if !status.success() {
         anyhow::bail!("systemctl --user daemon-reload failed (exit {status:?})");
     }
-    eprintln!("  [3/4] systemctl --user daemon-reload OK");
+    eprintln!("  [4/5] systemctl --user daemon-reload OK");
 
     let status = std::process::Command::new("systemctl")
         .args(["--user", "enable", "wayland-2-gnome.service"])
@@ -157,7 +174,7 @@ WantedBy=graphical-session.target
     if !status.success() {
         anyhow::bail!("systemctl --user enable failed (exit {status:?})");
     }
-    eprintln!("  [4/4] systemctl --user enable OK");
+    eprintln!("  [5/5] systemctl --user enable OK");
 
     eprintln!();
     eprintln!("Service installed. Start it with:");

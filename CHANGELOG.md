@@ -5,6 +5,14 @@ All notable changes to Wayland 2 GNOME are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-04-28
+
+### Fixed
+- **`--install` now copies the binary to `~/.local/bin/`** instead of assuming it
+  lives in `~/.cargo/bin/`. The generated systemd service unit points
+  `ExecStart` at `%h/.local/bin/wayland-2-gnome`, resolving the "No such file
+  or directory" error when only `cargo build --release` was run.
+
 ## [0.1.2] - 2026-04-28
 
 ### Added
