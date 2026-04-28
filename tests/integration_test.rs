@@ -3,11 +3,11 @@
 //! Sets up a mock compositor, connects the bridge, then runs a mock client
 //! to verify the full protocol translation pipeline.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use wayland_2_gnome::proxy;
 
@@ -182,12 +182,12 @@ fn test_registry_forwarding_and_layer_shell_injection() {
     let rdir = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| "/run/user/1000".to_string());
     let bridge_path = format!("{rdir}/{bridge_socket}");
-    let mut client = std::os::unix::net::UnixStream::connect(&bridge_path)
+    let client = std::os::unix::net::UnixStream::connect(&bridge_path)
         .expect("client connected to bridge");
     client.set_nonblocking(false).ok();
 
     // Accept the compositor-side connection
-    let mut comp_stream = compositor.accept_connection();
+    let comp_stream = compositor.accept_connection();
 
     // Client sends: wl_display.get_registry (oid=1, op=1, new_id=2)
     let reg_new_id = 2u32;
@@ -290,11 +290,11 @@ fn test_get_layer_surface_translation() {
     let rdir = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| "/run/user/1000".to_string());
     let bridge_path = format!("{rdir}/{bridge_socket}");
-    let mut client = std::os::unix::net::UnixStream::connect(&bridge_path)
+    let client = std::os::unix::net::UnixStream::connect(&bridge_path)
         .expect("client connect");
     client.set_nonblocking(false).ok();
 
-    let mut comp_stream = compositor.accept_connection();
+    let comp_stream = compositor.accept_connection();
 
     // Phase 1: Registry setup (same as first test but simpler)
     // Client: get_registry

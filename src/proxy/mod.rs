@@ -2,8 +2,12 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
+use calloop::{EventLoop, Interest, Mode};
+use calloop::generic::Generic;
+use calloop::LoopSignal;
 use log::{debug, error, info, warn};
 
 /// Static flag set by signal handlers to request graceful shutdown.
@@ -31,6 +35,7 @@ impl RawMsg {
         let os = u32::from_ne_bytes([self.raw[4], self.raw[5], self.raw[6], self.raw[7]]);
         (os & 0xffff) as u16
     }
+    #[allow(dead_code)]
     fn size(&self) -> usize {
         let os = u32::from_ne_bytes([self.raw[4], self.raw[5], self.raw[6], self.raw[7]]);
         (os >> 16) as usize
@@ -236,6 +241,7 @@ const OID_BASE: u32 = 0x80000000;
 
 /// Information about a global as advertised by the compositor.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct GlobalInfo {
     name: u32,
     interface: String,
@@ -244,6 +250,7 @@ struct GlobalInfo {
 
 /// A tracked fake object managed by the bridge.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct FakeObject {
     /// The OID the client assigned to this object.
     cli_oid: u32,
@@ -468,6 +475,7 @@ fn make_global_event(reg_oid: u32, name: u32, iface: &str, version: u32) -> Vec<
 }
 
 /// Build a wl_display.delete_id event.
+#[allow(dead_code)]
 fn make_delete_id(display_oid: u32, id: u32) -> Vec<u8> {
     let pay = id.to_ne_bytes();
     make_raw(display_oid, 1, &pay) // op 1 = delete_id
@@ -495,108 +503,116 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         translation_map: Vec::new(),
     };
 
-    let cfd = s.to_cli.as_raw_fd();
-    let ofd = s.to_comp.as_raw_fd();
+    // Use calloop-based event loop for this session.
+    let mut evloop: EventLoop<Session> = EventLoop::try_new()?;
+    let signal = Arc::new(std::sync::Mutex::new(Some(evloop.get_signal())));
+    let handle = evloop.handle();
 
+    fn stop_session(sig: &Arc<std::sync::Mutex<Option<LoopSignal>>>) {
+        if let Some(s) = sig.lock().unwrap().take() {
+            s.stop();
+        }
+    }
+
+    // Register compositor FD
+    let comp = s.to_comp.try_clone()?;
+    let sig_c = signal.clone();
+    handle.insert_source(
+        Generic::new(comp, Interest::READ, Mode::Level),
+        move |_readiness: calloop::Readiness,
+              _fd: &mut calloop::generic::NoIoDrop<UnixStream>,
+              session: &mut Session| {
+            // Read one message from compositor
+            let msg = match read_raw(&session.to_comp) {
+                Ok(m) => m,
+                Err(e) => {
+                    info!("Compositor EOF: {e}");
+                    cleanup_session(session);
+                    stop_session(&sig_c);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        e.to_string(),
+                    ));
+                }
+            };
+
+            // Collect phase: globals not yet accumulated
+            if !session.globals_collected && session.comp_reg_id > 0 {
+                if msg.object_id() == session.comp_reg_id && msg.opcode() == 0 {
+                    // Registry global event → forward to client and track
+                    let _ = send_raw(&session.to_cli, &msg);
+                    sniff_global(session, &msg);
+                } else {
+                    // Non-registry event → globals done, inject layer shell
+                    session.globals_collected = true;
+                    if let Err(e) = maybe_inject_layer_shell(session) {
+                        error!("Inject layer shell: {e}");
+                    }
+                    info!("globals collected: {} total", session.comp_globals.len());
+                    // Forward this message to client too
+                    let _ = send_raw(&session.to_cli, &msg);
+                }
+                return Ok(calloop::PostAction::Continue);
+            }
+
+            // Normal forwarding
+            handle_comp(session, &msg).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            })?;
+            Ok(calloop::PostAction::Continue)
+        },
+    )?;
+
+    // Register client FD
+    let cli = s.to_cli.try_clone()?;
+    let sig_c = signal.clone();
+    handle.insert_source(
+        Generic::new(cli, Interest::READ, Mode::Level),
+        move |_readiness: calloop::Readiness,
+              _fd: &mut calloop::generic::NoIoDrop<UnixStream>,
+              session: &mut Session| {
+            let msg = match read_raw(&session.to_cli) {
+                Ok(m) => m,
+                Err(e) => {
+                    info!("Client EOF: {e}");
+                    cleanup_session(session);
+                    stop_session(&sig_c);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        e.to_string(),
+                    ));
+                }
+            };
+
+            // Intercept wl_surface.set_buffer_scale (op 12)
+            let oid = msg.object_id();
+            let op = msg.opcode();
+            if op == 12 {
+                if let Some(_entry) = session.translation_map.iter().find(|e| e.cli_surface_oid == oid) {
+                    let pay = &msg.raw[8..];
+                    if pay.len() >= 4 {
+                        let scale = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                        info!("  Intercepted set_buffer_scale: surface={}, scale={}", oid, scale);
+                    }
+                }
+            }
+
+            handle_cli(session, &msg).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+            })?;
+            Ok(calloop::PostAction::Continue)
+        },
+    )?;
+
+    // Dispatch until LoopSignal::stop() is called OR shutdown flag is set
     loop {
-        let mut pfds = [
-            libc::pollfd {
-                fd: cfd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: ofd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let ret = unsafe { libc::poll(pfds.as_mut_ptr(), 2, 1000) };
-        if ret < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            bail!("poll failed: {}", std::io::Error::last_os_error());
-        }
-
-        if pfds[0].revents & (libc::POLLNVAL | libc::POLLHUP | libc::POLLERR) != 0 {
-            info!("Client closed");
-            return Ok(());
-        }
-        if pfds[1].revents & (libc::POLLNVAL | libc::POLLHUP | libc::POLLERR) != 0 {
-            info!("Compositor closed");
-            return Ok(());
-        }
-
-        // Collect phase: only read from compositor until globals are done
-        if !s.globals_collected && s.comp_reg_id > 0 && pfds[1].revents & libc::POLLIN != 0 {
-            let msg = match read_raw(&s.to_comp) {
-                Ok(m) => m,
-                Err(e) => {
-                    info!("Compositor EOF: {e}");
-                    cleanup_session(&mut s);
-                    return Ok(());
-                }
-            };
-
-            if msg.object_id() == s.comp_reg_id && msg.opcode() == 0 {
-                // Registry global event — forward now
-                send_raw(&s.to_cli, &msg)?;
-                sniff_global(&mut s, &msg);
-            } else {
-                // Non-registry event → globals collection done
-                // Inject missing layer shell BEFORE forwarding this message
-                // so the client sees: real globals → fake globals → callback.done
-                s.globals_collected = true;
-                maybe_inject_layer_shell(&mut s)?;
-                info!("globals collected: {} total", s.comp_globals.len());
-                // Now forward the final message (callback.done or whatever)
-                send_raw(&s.to_cli, &msg)?;
-            }
-            continue;
-        }
-
-    // Normal forwarding: read client → compositor
-    if pfds[0].revents & libc::POLLIN != 0 {
-        let msg = match read_raw(&s.to_cli) {
-            Ok(m) => m,
-            Err(e) => {
-                info!("Client EOF: {e}");
-                cleanup_session(&mut s);
-                return Ok(());
-            }
-        };
-        
-        // Intercept wl_surface.set_buffer_scale (op 12)
-        let oid = msg.object_id();
-        let op = msg.opcode();
-        if op == 12 { // wl_surface.set_buffer_scale
-            // Check if this surface belongs to one of our translated layers
-            if let Some(_entry) = s.translation_map.iter().find(|e| e.cli_surface_oid == oid) {
-                let pay = &msg.raw[8..];
-                if pay.len() >= 4 {
-                    let scale = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-                    info!("  Intercepted wl_surface.set_buffer_scale: surface={}, scale={} -> Ensuring XDG sync", oid, scale);
-                }
-            }
-        }
-
-        handle_cli(&mut s, &msg)?;
-    }
-
-        // Normal forwarding: read compositor → client
-        if pfds[1].revents & libc::POLLIN != 0 {
-            let msg = match read_raw(&s.to_comp) {
-                Ok(m) => m,
-                Err(e) => {
-                    info!("Compositor EOF: {e}");
-                    cleanup_session(&mut s);
-                    return Ok(());
-                }
-            };
-            handle_comp(&mut s, &msg)?;
+        let _ = evloop.dispatch(Some(Duration::from_millis(200)), &mut s);
+        if signal.lock().unwrap().is_none() || SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+            break;
         }
     }
+
+    Ok(())
 }
 
 // ─── Orphan cleanup ────────────────────────────────────────────────────────
