@@ -2,7 +2,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 
 use anyhow::{bail, Result};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 // ─── Wire message ───────────────────────────────────────────────────────────
 
@@ -20,6 +20,19 @@ impl RawMsg {
         let os = u32::from_ne_bytes([self.raw[4], self.raw[5], self.raw[6], self.raw[7]]);
         (os & 0xffff) as u16
     }
+    fn size(&self) -> usize {
+        let os = u32::from_ne_bytes([self.raw[4], self.raw[5], self.raw[6], self.raw[7]]);
+        (os >> 16) as usize
+    }
+}
+
+fn make_raw(oid: u32, op: u16, pay: &[u8]) -> Vec<u8> {
+    let total = 8u32 + pay.len() as u32;
+    let mut m = Vec::with_capacity(total as usize);
+    m.extend_from_slice(&oid.to_ne_bytes());
+    m.extend_from_slice(&((total << 16) | op as u32).to_ne_bytes());
+    m.extend_from_slice(pay);
+    m
 }
 
 /// Send one complete Wayland wire message (data + optional FDs) via sendmsg.
@@ -84,8 +97,6 @@ fn send_raw(stream: &UnixStream, msg: &RawMsg) -> Result<()> {
     }
     Ok(())
 }
-
-
 
 // ─── Read raw message ───────────────────────────────────────────────────────
 
@@ -164,17 +175,15 @@ fn read_raw(stream: &UnixStream) -> Result<RawMsg> {
         }
         raw.extend_from_slice(&pay_buf);
 
-        // If FDs arrived with payload (unusual), merge into our cbuf
         if pay_msg.msg_controllen > 0 {
             cbuf = pay_cbuf;
         }
     }
 
-    // Extract FDs from header (or payload if header had none)
+    // Extract FDs from cbuf
     let fds = if cbuf.iter().any(|&b| b != 0) {
         let mut fds = Vec::new();
         let mut ch = unsafe { libc::CMSG_FIRSTHDR(&hdr_msg) };
-        // If no FDs in header, check in pay_msg structures — simplified: just check cbuf
         while !ch.is_null() {
             let c = unsafe { &*ch };
             if c.cmsg_level == libc::SOL_SOCKET && c.cmsg_type == libc::SCM_RIGHTS {
@@ -199,6 +208,19 @@ fn read_raw(stream: &UnixStream) -> Result<RawMsg> {
     Ok(RawMsg { raw, fds })
 }
 
+// ─── Protocol injection constants ───────────────────────────────────────────
+
+/// The interface string for wlr-layer-shell.
+const LAYER_SHELL_IFACE: &str = "zwlr_layer_shell_v1";
+/// Max version we'll advertise for the injected layer shell.
+const LAYER_SHELL_VERSION: u32 = 5;
+/// Fake global name we inject when the compositor doesn't have layer shell.
+/// Using a high value to avoid colliding with real compositor globals.
+const FAKE_GLOBAL_LAYER_SHELL: u32 = 1000;
+/// Starting OID for bridge-managed objects (no conflict with client OIDs).
+/// The client typically uses small OIDs (2-20+). We use 1000+.
+const OID_BASE: u32 = 1000;
+
 // ─── State ──────────────────────────────────────────────────────────────────
 
 /// Information about a global as advertised by the compositor.
@@ -207,6 +229,19 @@ struct GlobalInfo {
     name: u32,
     interface: String,
     version: u32,
+}
+
+/// A tracked fake object managed by the bridge.
+#[derive(Debug, Clone)]
+struct FakeObject {
+    /// The OID the client assigned to this object.
+    cli_oid: u32,
+    /// The interface name (e.g., "zwlr_layer_shell_v1").
+    iface: String,
+    /// Next available sub-object OID for objects created through this one.
+    next_sub_oid: u32,
+    /// Any associated data (e.g., namespace for a layer surface).
+    data: String,
 }
 
 struct Session {
@@ -220,6 +255,14 @@ struct Session {
     comp_reg_id: u32,
     /// Whether we've finished collecting globals (got a non-registry event).
     globals_collected: bool,
+    /// Whether we injected a layer shell global because the compositor didn't have one.
+    injected_layer_shell: bool,
+    /// Fake objects managed by the bridge (keyed by cli_oid).
+    fake_objects: Vec<FakeObject>,
+    /// The name of the injected fake global (if any).
+    fake_global_name: Option<u32>,
+    /// Next available OID for objects created internally.
+    next_oid: u32,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────────────
@@ -298,6 +341,35 @@ impl Default for BridgeConfig {
     }
 }
 
+// ─── Wire format helpers ────────────────────────────────────────────────────
+
+/// Build a wl_registry.global event for injecting a fake global.
+/// Build a wl_registry.global event.
+/// Wayland wire format: name(u32) + iface_slen(u32, including null) + iface(padded to 4) + version(u32).
+fn make_global_event(reg_oid: u32, name: u32, iface: &str, version: u32) -> Vec<u8> {
+    // Null-terminate the string
+    let mut iface_b = iface.as_bytes().to_vec();
+    iface_b.push(0);
+    let slen = iface_b.len() as u32; // includes null
+    // Pad to 4 bytes
+    let padded = ((slen as usize) + 3) & !3;
+    let mut pay = Vec::with_capacity(4 + 4 + padded + 4);
+    pay.extend_from_slice(&name.to_ne_bytes());          // 4 bytes: name
+    pay.extend_from_slice(&slen.to_ne_bytes());           // 4 bytes: string length
+    pay.extend_from_slice(&iface_b);                      // slen bytes: interface name
+    while pay.len() < (8 + padded) {
+        pay.push(0);
+    }
+    pay.extend_from_slice(&version.to_ne_bytes());       // 4 bytes: version
+    make_raw(reg_oid, 0, &pay) // op 0 = global
+}
+
+/// Build a wl_display.delete_id event.
+fn make_delete_id(display_oid: u32, id: u32) -> Vec<u8> {
+    let pay = id.to_ne_bytes();
+    make_raw(display_oid, 1, &pay) // op 1 = delete_id
+}
+
 // ─── Session loop ───────────────────────────────────────────────────────────
 
 fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
@@ -308,6 +380,10 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         cli_reg_id: 0,
         comp_reg_id: 0,
         globals_collected: false,
+        injected_layer_shell: false,
+        fake_objects: Vec::new(),
+        fake_global_name: None,
+        next_oid: OID_BASE,
     };
 
     let cfd = s.to_cli.as_raw_fd();
@@ -353,51 +429,19 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
                 }
             };
 
-            // Forward to client first, then sniff
-            send_raw(&s.to_cli, &msg)?;
-
             if msg.object_id() == s.comp_reg_id && msg.opcode() == 0 {
-                // Registry global event — collect
-                let pay = &msg.raw[8..];
-                if pay.len() >= 12 {
-                    let gname = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-                    let slen_raw = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
-                    let slen = slen_raw as usize;
-                    let iface_end = (8 + slen).min(pay.len());
-                    let iface = if iface_end > 8 {
-                        let mut s = String::new();
-                        for &b in &pay[8..iface_end] {
-                            if b == 0 {
-                                break;
-                            }
-                            s.push(b as char);
-                        }
-                        s
-                    } else {
-                        String::new()
-                    };
-                    let ver_offset = 8 + ((slen + 3) & !3);
-                    let version = if ver_offset + 4 <= pay.len() {
-                        u32::from_ne_bytes([
-                            pay[ver_offset],
-                            pay[ver_offset + 1],
-                            pay[ver_offset + 2],
-                            pay[ver_offset + 3],
-                        ])
-                    } else {
-                        1
-                    };
-                    info!("  collected global: name={gname}, iface='{iface}', v{version}");
-                    s.comp_globals.push(GlobalInfo {
-                        name: gname,
-                        interface: iface,
-                        version,
-                    });
-                }
+                // Registry global event — forward now
+                send_raw(&s.to_cli, &msg)?;
+                sniff_global(&mut s, &msg);
             } else {
                 // Non-registry event → globals collection done
+                // Inject missing layer shell BEFORE forwarding this message
+                // so the client sees: real globals → fake globals → callback.done
                 s.globals_collected = true;
+                maybe_inject_layer_shell(&mut s)?;
                 info!("globals collected: {} total", s.comp_globals.len());
+                // Now forward the final message (callback.done or whatever)
+                send_raw(&s.to_cli, &msg)?;
             }
             continue;
         }
@@ -423,9 +467,91 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
                     return Ok(());
                 }
             };
-            send_raw(&s.to_cli, &msg)?;
+            handle_comp(&mut s, &msg)?;
         }
     }
+}
+
+// ─── Global sniffing & injection ────────────────────────────────────────────
+
+fn sniff_global(s: &mut Session, msg: &RawMsg) {
+    let pay = &msg.raw[8..];
+    if pay.len() < 12 {
+        return;
+    }
+    let gname = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+    let slen_raw = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+    let slen = slen_raw as usize;
+    let iface_end = (8 + slen).min(pay.len());
+    let iface = if iface_end > 8 {
+        let mut s = String::new();
+        for &b in &pay[8..iface_end] {
+            if b == 0 {
+                break;
+            }
+            s.push(b as char);
+        }
+        s
+    } else {
+        String::new()
+    };
+    let ver_offset = 8 + ((slen + 3) & !3);
+    let version = if ver_offset + 4 <= pay.len() {
+        u32::from_ne_bytes([
+            pay[ver_offset],
+            pay[ver_offset + 1],
+            pay[ver_offset + 2],
+            pay[ver_offset + 3],
+        ])
+    } else {
+        1
+    };
+    info!("  collected global: name={gname}, iface='{iface}', v{version}");
+    s.comp_globals.push(GlobalInfo {
+        name: gname,
+        interface: iface,
+        version,
+    });
+}
+
+/// After globals are collected, inject a fake `zwlr_layer_shell_v1` global
+/// if the compositor didn't advertise one.
+fn maybe_inject_layer_shell(s: &mut Session) -> Result<()> {
+    let has_layer_shell = s.comp_globals.iter().any(|g| g.interface == "zwlr_layer_shell_v1");
+    if has_layer_shell {
+        info!("compositor has zwlr_layer_shell_v1 — no injection needed");
+        return Ok(());
+    }
+
+    info!(
+        "compositor lacks zwlr_layer_shell_v1 — injecting fake global name={}",
+        FAKE_GLOBAL_LAYER_SHELL
+    );
+
+    // Send a wl_registry.global event to the client
+    let evt = make_global_event(
+        s.cli_reg_id,
+        FAKE_GLOBAL_LAYER_SHELL,
+        LAYER_SHELL_IFACE,
+        LAYER_SHELL_VERSION,
+    );
+    send_raw(
+        &s.to_cli,
+        &RawMsg {
+            raw: evt,
+            fds: Vec::new(),
+        },
+    )?;
+
+    s.injected_layer_shell = true;
+    s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
+    // Also add to our local list for tracking
+    s.comp_globals.push(GlobalInfo {
+        name: FAKE_GLOBAL_LAYER_SHELL,
+        interface: "zwlr_layer_shell_v1".into(),
+        version: LAYER_SHELL_VERSION,
+    });
+    Ok(())
 }
 
 // ─── Client messages ────────────────────────────────────────────────────────
@@ -433,7 +559,7 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
 fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let oid = msg.object_id();
 
-    debug!("cli ➔ comp: oid={}, op={}, size={}", oid, msg.opcode(), msg.raw.len());
+    debug!("cli ➔ comp: oid={}, op={}, size={} raw={:02x?}", oid, msg.opcode(), msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
 
     // wl_display.get_registry (oid=1, op=1) — forward, then enable sniffing
     if oid == 1 && msg.opcode() == 1 {
@@ -449,24 +575,309 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         return Ok(());
     }
 
-    // Registry bind — log it, then forward
+    // Registry bind — check if it's for our injected global
     if s.cli_reg_id > 0 && oid == s.cli_reg_id && msg.opcode() == 0 {
-        let _ = log_bind_and_forward(s, msg);
-        return Ok(());
+        return handle_bind(s, msg);
+    }
+
+    // Check if this message targets a fake bridge-managed object
+    let fake_idx = s.fake_objects.iter().position(|f| f.cli_oid == oid);
+    if let Some(idx) = fake_idx {
+        // Clone the fake object info so we can drop the immutable borrow
+        let fake = s.fake_objects[idx].clone();
+        return handle_fake_msg(s, &fake, msg);
+    }
+
+    // Dynamic detection: if the compositor doesn't have layer_shell (we injected it),
+    // a message with op=0 and largish payload could be get_layer_surface on a
+    // proxy that got bound with a different new_id than the wire bind.
+    // Try to detect it dynamically.
+    // sniff_done is when globals_collected is true
+    let sniff_done = s.globals_collected;
+    if sniff_done && s.fake_global_name.is_some() && oid != 1 && oid != s.cli_reg_id && msg.opcode() == 0 && msg.raw.len() >= 32 && msg.raw.len() <= 48 {
+        // This could be get_layer_surface (op=0 in layer_shell)
+        // Wire layout after 8-byte header:
+        //   new_id(u32) at offset 8
+        //   surface(u32) at offset 12
+        //   output_or_zero(u32) at offset 16
+        //   layer(u32) at offset 20
+        //   ns_slen(u32) at offset 24
+        //   ns_data(slen bytes) at offset 28
+        //   padding to align 4
+        // get_layer_surface has a string namespace like "layer-test" or "overlay" etc.
+        let slen = if msg.raw.len() >= 28 {
+            Some(u32::from_ne_bytes([msg.raw[24], msg.raw[25], msg.raw[26], msg.raw[27]]))
+        } else {
+            None
+        };
+        if let Some(slen) = slen {
+            if slen <= 64 && slen >= 4 {
+                let ns_start = 28;
+                let ns_end = ns_start + slen as usize;
+                if ns_end <= msg.raw.len() {
+                    let ns = &msg.raw[ns_start..ns_end];
+                    // filter out null terminator for comparison
+                    let ns_trimmed = if ns.last() == Some(&0) { &ns[..ns.len()-1] } else { ns };
+                    if !ns_trimmed.is_ascii() || ns_trimmed.iter().any(|&b| b < 32) {
+                        // Not a valid string — not get_layer_surface
+                        send_raw(&s.to_comp, msg)?;
+                        return Ok(());
+                    }
+                    info!("🎣 dynamic intercept: cli_oid={} seems to be layer_shell, ns='{}'", oid, String::from_utf8_lossy(ns_trimmed));
+                    // First, remove the original fake object for new_id=20 (if any),
+                    // and replace with the correct OID
+                    if let Some(pos) = s.fake_objects.iter().position(|f| f.cli_oid == 20) {
+                        s.fake_objects[pos].cli_oid = oid;
+                    } else {
+                        s.fake_objects.push(FakeObject {
+                            cli_oid: oid, // the real OID the client uses
+                            iface: "zwlr_layer_shell_v1".to_string(),
+                            data: String::new(),
+                            next_sub_oid: 1,
+                        });
+                    }
+                    // Now dispatch to fake handler
+                    let fake_idx = s.fake_objects.iter().position(|f| f.cli_oid == oid).unwrap();
+                    let fake = s.fake_objects[fake_idx].clone();
+                    return handle_fake_msg(s, &fake, msg);
+                }
+            }
+        }
     }
 
     // Everything else: forward raw
     send_raw(&s.to_comp, msg)
 }
 
-fn log_bind_and_forward(s: &Session, msg: &RawMsg) -> Result<()> {
+fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let pay = &msg.raw[8..];
-    if pay.len() >= 12 {
-        let global_name = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-        let new_id = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
-        let global = s.comp_globals.iter().find(|g| g.name == global_name);
-        let iface = global.map(|g| g.interface.as_str()).unwrap_or("?");
-        info!("bind: name={global_name}, new_id={new_id}, iface={iface}");
+    if pay.len() < 12 {
+        warn!("bind payload too short");
+        send_raw(&s.to_comp, msg)?;
+        return Ok(());
     }
+
+    let global_name = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+    let new_id = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+    let global = s.comp_globals.iter().find(|g| g.name == global_name);
+    let iface = global.map(|g| g.interface.as_str()).unwrap_or("?");
+    info!("bind: name={global_name}, new_id={new_id}, iface={iface}");
+
+    // If this is our injected layer shell, don't forward to compositor
+    if global_name == FAKE_GLOBAL_LAYER_SHELL {
+        info!("  🎣 intercepted fake bind for zwlr_layer_shell_v1 → cli_oid={new_id}");
+        s.fake_objects.push(FakeObject {
+            cli_oid: new_id,
+            iface: "zwlr_layer_shell_v1".into(),
+            next_sub_oid: new_id + 1,
+            data: String::new(),
+        });
+        // All subsequent messages to this OID are handled internally
+        return Ok(());
+    }
+
+    // Real global: forward to compositor
     send_raw(&s.to_comp, msg)
+}
+
+/// Handle a message targeting a fake bridge-managed object.
+fn handle_fake_msg(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
+    match fake.iface.as_str() {
+        "zwlr_layer_shell_v1" => handle_layer_shell_request(s, fake, msg)?,
+        "zwlr_layer_surface_v1" => handle_layer_surface_request(s, fake, msg)?,
+        other => {
+            info!("  unknown fake iface '{other}', oid={}", fake.cli_oid);
+        }
+    }
+    Ok(())
+}
+
+// ─── Layer shell protocol handlers ──────────────────────────────────────────
+
+fn handle_layer_shell_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
+    let op = msg.opcode();
+    match op {
+        0 => {
+            // get_layer_surface(new_id, surface, output, layer, namespace)
+            // In wire format, arguments are serialized in order:
+            //   new_id(u32) | surface(u32) | output(u32) | layer(u32) | slen(u32) | string(slen+pad)
+            let pay = &msg.raw[8..];
+            if pay.len() < 24 {
+                info!("  get_layer_surface: payload too short ({})", pay.len());
+                return Ok(());
+            }
+
+            let new_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+            let surface_id = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+            // output at pay[8..12] (unused)
+            let layer_raw = u32::from_ne_bytes([pay[12], pay[13], pay[14], pay[15]]);
+            let layer = match layer_raw {
+                0 => "Background",
+                1 => "Bottom",
+                2 => "Top",
+                3 => "Overlay",
+                _ => "Unknown",
+            };
+
+            // Parse namespace string (after layer, offset 16 from payload start)
+            let ns_slen = u32::from_ne_bytes([pay[16], pay[17], pay[18], pay[19]]);
+            let ns_slen = ns_slen as usize;
+            let ns = if ns_slen > 0 {
+                let ns_end = (20 + ns_slen).min(pay.len());
+                let s = pay[20..ns_end]
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as char)
+                    .collect::<String>();
+                s
+            } else {
+                String::new()
+            };
+
+            info!(
+                "  get_layer_surface: new_id={}, surface={}, layer={}, ns='{}'",
+                new_id, surface_id, layer, ns
+            );
+
+            // Create a fake layer surface object
+            s.fake_objects.push(FakeObject {
+                cli_oid: new_id,
+                iface: "zwlr_layer_surface_v1".into(),
+                next_sub_oid: new_id + 1,
+                data: format!("layer={}, ns={}", layer_raw, ns),
+            });
+
+            // Send a configure event to the client so it knows the surface is ready.
+            // This is a zwlr_layer_surface_v1.configure event (op=0).
+            // Payload: serial(u32), width(u32), height(u32)
+            let serial = 1u32;
+            let width = 400u32;
+            let height = 300u32;
+            let mut evt_pay = Vec::with_capacity(12);
+            evt_pay.extend_from_slice(&serial.to_ne_bytes());
+            evt_pay.extend_from_slice(&width.to_ne_bytes());
+            evt_pay.extend_from_slice(&height.to_ne_bytes());
+            let evt = make_raw(new_id, 0, &evt_pay); // op 0 = configure
+            info!("  ➡ sending configure(serial={}, {}x{}) to client", serial, width, height);
+
+            send_raw(
+                &s.to_cli,
+                &RawMsg {
+                    raw: evt,
+                    fds: Vec::new(),
+                },
+            )?;
+        }
+        1 => {
+            // destroy
+            info!("  layer_shell.destroy oid={}", fake.cli_oid);
+        }
+        other => {
+            debug!("  layer_shell: unknown op={other}, oid={}", fake.cli_oid);
+        }
+    }
+    Ok(())
+}
+
+fn handle_layer_surface_request(_s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
+    let op = msg.opcode();
+    let pay = &msg.raw[8..];
+    match op {
+        0 => {
+            // set_size(width, height)
+            if pay.len() >= 8 {
+                let w = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                let h = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+                info!("  layer_surface.set_size: oid={}, {}x{}", fake.cli_oid, w, h);
+            }
+        }
+        1 => {
+            // set_anchor(anchor)
+            if pay.len() >= 4 {
+                let a = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                info!("  layer_surface.set_anchor: oid={}, mask={}", fake.cli_oid, a);
+            }
+        }
+        2 => {
+            // set_exclusive_zone(zone)
+            if pay.len() >= 4 {
+                let z = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                info!("  layer_surface.set_exclusive_zone: oid={}, {}", fake.cli_oid, z);
+            }
+        }
+        3 => {
+            // set_margin(top, right, bottom, left)
+            if pay.len() >= 16 {
+                let t = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                let r = i32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+                let b = i32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]);
+                let l = i32::from_ne_bytes([pay[12], pay[13], pay[14], pay[15]]);
+                info!(
+                    "  layer_surface.set_margin: oid={}, t={} r={} b={} l={}",
+                    fake.cli_oid, t, r, b, l
+                );
+            }
+        }
+        4 => {
+            // set_keyboard_interactivity(interactive)
+            info!("  layer_surface.set_keyboard_interactivity: oid={}", fake.cli_oid);
+        }
+        5 => {
+            // get_popup
+            info!("  layer_surface.get_popup: oid={}", fake.cli_oid);
+        }
+        6 => {
+            // ack_configure(serial)
+            if pay.len() >= 4 {
+                let serial = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                info!("  layer_surface.ack_configure: oid={}, serial={}", fake.cli_oid, serial);
+            }
+        }
+        7 => {
+            // destroy
+            info!("  layer_surface.destroy: oid={}", fake.cli_oid);
+        }
+        other => {
+            debug!("  layer_surface: unknown op={other}, oid={}", fake.cli_oid);
+        }
+    }
+    Ok(())
+}
+
+// ─── Compositor messages ────────────────────────────────────────────────────
+
+fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
+    let oid = msg.object_id();
+
+    debug!("comp ➔ cli: oid={}, op={}, size={} raw={:02x?}", oid, msg.opcode(), msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
+
+    // wl_display.error — log and forward
+    if oid == 1 && msg.opcode() == 0 {
+        let pay = &msg.raw[8..];
+        let err_oid = if pay.len() >= 4 {
+            u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]])
+        } else {
+            0
+        };
+        let err_code = if pay.len() >= 8 {
+            u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]])
+        } else {
+            0
+        };
+        let err_msg = if pay.len() > 8 {
+            String::from_utf8_lossy(&pay[8..])
+                .trim_end_matches('\0')
+                .to_string()
+        } else {
+            String::new()
+        };
+        error!(
+            "⚠ COMPOSITOR PROTOCOL ERROR: object={}, code={}, msg='{}'",
+            err_oid, err_code, err_msg
+        );
+        return send_raw(&s.to_cli, msg);
+    }
+
+    // Forward everything else to client
+    send_raw(&s.to_cli, msg)
 }
