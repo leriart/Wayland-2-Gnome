@@ -1,29 +1,17 @@
-//! Wayland GNOME Bridge - Phase 1: Raw passthrough proxy
+//! Wayland GNOME Bridge
 //!
-//! This is the MVP: a transparent byte-level proxy that sits between
-//! a Wayland client and GNOME Mutter. No protocol awareness yet.
-//!
-//! Usage:
-//!   WAYLAND_DISPLAY=wayland-gnome-bridge-0 cava-bg on
-//!   (or set the env var automatically via wrapper script)
+//! Phase 1: Raw proxy server.
+//! Listens on a Unix socket, accepts client connections,
+//! connects to the real Wayland compositor (GNOME Mutter),
+//! and proxies raw messages bidirectionally.
 
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-use std::process;
-use std::sync::Arc;
+use std::os::unix::net::UnixListener;
+use std::thread;
 
 use anyhow::{Context, Result};
-use log::{error, info, warn};
-use nix::sys::stat::Mode;
-use nix::unistd::{mkfifo, unlink};
-use wayland_backend::server::Backend;
-use wayland_server::Display;
+use log::{error, info};
 
 mod proxy;
-
-/// Default socket name for the bridge
-const SOCKET_NAME: &str = "wayland-gnome-bridge-0";
 
 /// Bridge configuration
 #[derive(Debug, Clone)]
@@ -32,20 +20,14 @@ struct BridgeConfig {
     socket_name: String,
     /// Real compositor's display (e.g., "wayland-0")
     compositor_display: String,
-    /// Verbose logging
-    debug: bool,
-    /// PID file path
-    pid_file: Option<PathBuf>,
 }
 
 impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
-            socket_name: SOCKET_NAME.to_string(),
-            compositor_display: env::var("WAYLAND_DISPLAY")
+            socket_name: "wayland-bridge-0".to_string(),
+            compositor_display: std::env::var("WAYLAND_DISPLAY")
                 .unwrap_or_else(|_| "wayland-0".to_string()),
-            debug: false,
-            pid_file: None,
         }
     }
 }
@@ -56,28 +38,42 @@ fn main() -> Result<()> {
     )
     .init();
 
-    let config = BridgeConfig {
-        ..Default::default()
-    };
+    let config = BridgeConfig::default();
+    let socket_path = format!("{}/{}", socket_dir()?, config.socket_name);
 
     info!(
-        "Starting Wayland GNOME Bridge on socket '{}', proxying to '{}'",
-        config.socket_name, config.compositor_display
+        "Starting bridge on '{}', proxying to '{}'",
+        socket_path, config.compositor_display
     );
 
-    // Phase 1: Just set up the server side and connect to real compositor
-    // For now, this is a stub that proves the project compiles and runs.
-    //
-    // The real proxy loop will:
-    // 1. Create a wayland_server::Display
-    // 2. Listen on a socket in $XDG_RUNTIME_DIR
-    // 3. Accept client connections
-    // 4. For each client: fork a proxy handler that:
-    //    a. Connects to the real compositor (wayland-client)
-    //    b. Forwards all messages bidirectionally
-    // 5. Run a calloop event loop
+    // Remove old socket if present
+    let _ = std::fs::remove_file(&socket_path);
 
-    proxy::run_proxy(&config).context("Failed to run proxy")?;
+    // Bind listener
+    let listener =
+        UnixListener::bind(&socket_path).context("Failed to bind socket")?;
+    info!("Listening on {socket_path}");
+
+    // Accept connections
+    for stream in listener.incoming() {
+        match stream {
+            Ok(client) => {
+                let display = config.compositor_display.clone();
+                thread::spawn(move || {
+                    if let Err(e) = proxy::handle_client(client, &display) {
+                        error!("Client handler: {e}");
+                    }
+                });
+            }
+            Err(e) => error!("Accept failed: {e}"),
+        }
+    }
 
     Ok(())
+}
+
+fn socket_dir() -> Result<String> {
+    let dir = std::env::var("XDG_RUNTIME_DIR")
+        .context("XDG_RUNTIME_DIR is not set")?;
+    Ok(dir)
 }
