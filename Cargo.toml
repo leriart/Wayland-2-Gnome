@@ -1,0 +1,39 @@
+[package]
+name = "wayland-gnome-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Protocol-aware Wayland proxy translating wlr-layer-shell to GNOME Shell overlays"
+authors = ["Leriart"]
+repository = "https://github.com/leriart/wayland-gnome-bridge"
+
+[dependencies]
+# Wayland
+wayland-server = "0.31"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "client"] }
+wayland-backend = "0.3"
+
+# Async / Event loop
+calloop = "0.14"
+calloop-wayland-source = "0.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1.0"
+
+# Config
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+dirs = "5.0"
+
+# Misc
+libc = "0.2"
+nix = { version = "0.29", features = ["socket"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
