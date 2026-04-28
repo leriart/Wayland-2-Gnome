@@ -281,6 +281,10 @@ struct Session {
     fake_global_name: Option<u32>,
     /// Next available OID for objects created internally.
     next_oid: u32,
+    // --- Dynamic multi-monitor ---
+    tracked_outputs: Vec<TrackedOutput>,
+    output_events_delivered: bool,
+
 
     // --- Translation State ---
     cli_xdg_wm_base_id: u32,
@@ -307,6 +311,44 @@ struct TranslationEntry {
     pending_width: u32,
     pending_height: u32,
 }
+/// Tracked output for dynamic multi-monitor support.
+#[derive(Debug, Clone)]
+struct TrackedOutput {
+    comp_oid: u32,
+    global_name: u32,
+    x: i32,
+    y: i32,
+}
+
+/// Forward a wl_output global event to the client.
+fn forward_output_global(s: &mut Session, name: u32, iface: &str, version: u32) -> Result<()> {
+    let evt = make_global_event(s.cli_reg_id, name, iface, version);
+    send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() })?;
+    Ok(())
+}
+
+fn sniff_output_event(s: &mut Session, oid: u32, op: u16, pay: &[u8]) {
+    if let Some(tracked) = s.tracked_outputs.iter_mut().find(|t| t.comp_oid == oid) {
+        if op == 4 && pay.len() >= 16 {
+            let x = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+            let y = i32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+            if tracked.x != x || tracked.y != y {
+                info!("  Output {} geometry changed: ({}x{}) -> ({}x{})", oid, tracked.x, tracked.y, x, y);
+                tracked.x = x;
+                tracked.y = y;
+            }
+        }
+    }
+}
+
+fn handle_dynamic_output_global(s: &mut Session, name: u32, iface: &str, version: u32) -> Result<()> {
+    if iface == "wl_output" {
+        info!("  Dynamic: new wl_output global name={}, forwarding to client", name);
+        forward_output_global(s, name, iface, version)?;
+    }
+    Ok(())
+}
+
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
@@ -501,6 +543,9 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         comp_compositor_id: 0,
         comp_compositor_name: 0,
         translation_map: Vec::new(),
+        tracked_outputs: Vec::new(),
+        output_events_delivered: false,
+
     };
 
     // Use calloop-based event loop for this session.
@@ -1299,9 +1344,39 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let oid = msg.object_id();
     let op = msg.opcode();
 
-    // Intercept configure events from xdg_toplevel to translate them back to layer_surface
+    if s.tracked_outputs.iter().any(|t| t.comp_oid == oid) {
+        sniff_output_event(s, oid, op, &msg.raw[8..]);
+    }
+
+    if s.globals_collected && oid == s.comp_reg_id && op == 0 {
+        let pay = &msg.raw[8..];
+        if pay.len() >= 12 {
+            let gname = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+            let slen_raw = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+            let slen = slen_raw as usize;
+            let iface_end = (8 + slen).min(pay.len());
+            let iface = if iface_end > 8 {
+                let mut si = String::new();
+                for &b in &pay[8..iface_end] { if b == 0 { break; } si.push(b as char); }
+                si
+            } else { String::new() };
+            let ver_offset = 8 + ((slen + 3) & !3);
+            let version = if ver_offset + 4 <= pay.len() {
+                u32::from_ne_bytes([pay[ver_offset], pay[ver_offset+1], pay[ver_offset+2], pay[ver_offset+3]])
+            } else { 1 };
+            info!("  Dynamic global: name={}, iface='{}', v{}", gname, iface, version);
+            if iface == "wl_output" {
+                handle_dynamic_output_global(s, gname, &iface, version)?;
+            }
+            if !s.comp_globals.iter().any(|g| g.name == gname) {
+                s.comp_globals.push(GlobalInfo { name: gname, interface: iface, version });
+            }
+            return send_raw(&s.to_cli, msg);
+        }
+    }
+
     if let Some(pos) = s.translation_map.iter().position(|e| e.comp_toplevel_oid == oid) {
-        if op == 0 { // xdg_toplevel.configure(width, height, states)
+        if op == 0 {
             let pay = &msg.raw[8..];
             if pay.len() >= 8 {
                 let w = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
@@ -1309,25 +1384,21 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
                 s.translation_map[pos].pending_width = w;
                 s.translation_map[pos].pending_height = h;
                 debug!("  xdg_toplevel.configure: stored size {}x{}", w, h);
-                // No enviamos nada al cliente aún, esperamos al configure de xdg_surface que trae el serial
                 return Ok(());
             }
         }
     }
 
     if let Some(entry) = s.translation_map.iter().find(|e| e.comp_xdg_surface_oid == oid) {
-        if op == 0 { // xdg_surface.configure(serial)
+        if op == 0 {
             let pay = &msg.raw[8..];
             let serial = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-            
-            info!("  Translating xdg_surface.configure(serial={}) to layer_surface.configure({}x{})", 
+            info!("  Translating xdg_surface.configure(serial={}) -> layer_surface.configure({}x{})",
                 serial, entry.pending_width, entry.pending_height);
-            
             let mut l_pay = Vec::new();
             l_pay.extend_from_slice(&serial.to_ne_bytes());
             l_pay.extend_from_slice(&entry.pending_width.to_ne_bytes());
             l_pay.extend_from_slice(&entry.pending_height.to_ne_bytes());
-            
             return send_raw(&s.to_cli, &RawMsg {
                 raw: make_raw(entry.cli_layer_surface_oid, 0, &l_pay),
                 fds: Vec::new(),
@@ -1335,8 +1406,7 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
         }
     }
 
-    // Handle delete_id to keep translation_map clean
-    if oid == 1 && op == 1 { // wl_display.delete_id
+    if oid == 1 && op == 1 {
         let pay = &msg.raw[8..];
         if pay.len() >= 4 {
             let deleted_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
@@ -1347,35 +1417,18 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
         }
     }
 
-    debug!("comp ➔ cli: oid={}, op={}, size={} raw={:02x?}", oid, msg.opcode(), msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
+    debug!("comp -> cli: oid={}, op={}, size={} raw={:02x?}", oid, msg.opcode(), msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
 
-    // wl_display.error — log and forward
     if oid == 1 && msg.opcode() == 0 {
         let pay = &msg.raw[8..];
-        let err_oid = if pay.len() >= 4 {
-            u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]])
-        } else {
-            0
-        };
-        let err_code = if pay.len() >= 8 {
-            u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]])
-        } else {
-            0
-        };
-        let err_msg = if pay.len() > 8 {
-            String::from_utf8_lossy(&pay[8..])
-                .trim_end_matches('\0')
-                .to_string()
-        } else {
-            String::new()
-        };
-        error!(
-            "⚠ COMPOSITOR PROTOCOL ERROR: object={}, code={}, msg='{}'",
-            err_oid, err_code, err_msg
-        );
+        let err_oid = if pay.len() >= 4 { u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]) } else { 0 };
+        let err_code = if pay.len() >= 8 { u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]) } else { 0 };
+        let err_msg = if pay.len() > 8 { String::from_utf8_lossy(&pay[8..]).trim_end_matches('\0').to_string() } else { String::new() };
+        error!("COMPOSITOR PROTOCOL ERROR: object={}, code={}, msg='{}'", err_oid, err_code, err_msg);
         return send_raw(&s.to_cli, msg);
     }
 
-    // Forward everything else to client
     send_raw(&s.to_cli, msg)
 }
+
+
