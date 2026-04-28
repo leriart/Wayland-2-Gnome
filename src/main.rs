@@ -124,8 +124,11 @@ fn install_systemd_user_service(socket: &str, compositor: &str, config_path: Opt
     // Create ~/.local/bin if needed
     std::fs::create_dir_all(&local_bin_dir)?;
 
-    // Copy the binary to ~/.local/bin (overwrite if exists)
-    std::fs::copy(&self_path, &target_bin)?;
+    // Read our own binary into memory first, then write.
+    // This avoids "Text file busy" when source == target (i.e. the binary
+    // is running FROM ~/.local/bin and we're overwriting itself).
+    let binary_data = std::fs::read(&self_path)?;
+    std::fs::write(&target_bin, &binary_data)?;
     // Make sure it's executable
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&target_bin, std::fs::Permissions::from_mode(0o755))?;
