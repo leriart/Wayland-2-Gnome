@@ -276,6 +276,8 @@ struct Session {
 
 struct TranslationEntry {
     cli_layer_surface_oid: u32,
+    /// The xdg_surface OID the client might have created for the same wl_surface.
+    cli_xdg_surface_oid: u32,
     comp_xdg_surface_oid: u32,
     comp_toplevel_oid: u32,
     /// Original client wl_surface ID.
@@ -474,17 +476,32 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
             continue;
         }
 
-        // Normal forwarding: read client → compositor
-        if pfds[0].revents & libc::POLLIN != 0 {
-            let msg = match read_raw(&s.to_cli) {
-                Ok(m) => m,
-                Err(e) => {
-                    info!("Client EOF: {e}");
-                    return Ok(());
+    // Normal forwarding: read client → compositor
+    if pfds[0].revents & libc::POLLIN != 0 {
+        let msg = match read_raw(&s.to_cli) {
+            Ok(m) => m,
+            Err(e) => {
+                info!("Client EOF: {e}");
+                return Ok(());
+            }
+        };
+        
+        // Intercept wl_surface.set_buffer_scale (op 12)
+        let oid = msg.object_id();
+        let op = msg.opcode();
+        if op == 12 { // wl_surface.set_buffer_scale
+            // Check if this surface belongs to one of our translated layers
+            if let Some(entry) = s.translation_map.iter().find(|e| e.cli_surface_oid == oid) {
+                let pay = &msg.raw[8..];
+                if pay.len() >= 4 {
+                    let scale = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                    info!("  Intercepted wl_surface.set_buffer_scale: surface={}, scale={} -> Ensuring XDG sync", oid, scale);
                 }
-            };
-            handle_cli(&mut s, &msg)?;
+            }
         }
+
+        handle_cli(&mut s, &msg)?;
+    }
 
         // Normal forwarding: read compositor → client
         if pfds[1].revents & libc::POLLIN != 0 {
@@ -592,8 +609,35 @@ fn maybe_inject_layer_shell(s: &mut Session) -> Result<()> {
 
 fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let oid = msg.object_id();
+    let op = msg.opcode();
 
-    debug!("cli ➔ comp: oid={}, op={}, size={} raw={:02x?}", oid, msg.opcode(), msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
+    debug!("cli ➔ comp: oid={}, op={}, size={} raw={:02x?}", oid, op, msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
+
+    // Intercept xdg_wm_base.get_xdg_surface (op 2)
+    if s.cli_xdg_wm_base_id > 0 && oid == s.cli_xdg_wm_base_id && op == 2 {
+        let pay = &msg.raw[8..];
+        if pay.len() >= 8 {
+            let cli_xdg_surf_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+            let cli_surf_id = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+            
+            // Check if this wl_surface is already managed by a layer_surface
+            if let Some(pos) = s.translation_map.iter().position(|e| e.cli_surface_oid == cli_surf_id) {
+                info!("  Intercepted xdg_wm_base.get_xdg_surface: Alias cli_xdg_surf={} -> comp_xdg_surf={}", 
+                    cli_xdg_surf_id, s.translation_map[pos].comp_xdg_surface_oid);
+                
+                s.translation_map[pos].cli_xdg_surface_oid = cli_xdg_surf_id;
+                
+                // Track as fake to intercept its methods (like get_popup)
+                s.fake_objects.push(FakeObject {
+                    cli_oid: cli_xdg_surf_id,
+                    iface: "xdg_surface".into(),
+                    next_sub_oid: 0,
+                    data: String::new(),
+                });
+                return Ok(()); // Don't forward to compositor
+            }
+        }
+    }
 
     // wl_display.get_registry (oid=1, op=1) — forward, then enable sniffing
     if oid == 1 && msg.opcode() == 1 {
@@ -724,6 +768,7 @@ fn handle_fake_msg(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<(
     match fake.iface.as_str() {
         "zwlr_layer_shell_v1" => handle_layer_shell_request(s, fake, msg)?,
         "zwlr_layer_surface_v1" => handle_layer_surface_request(s, fake, msg)?,
+        "xdg_surface" => handle_xdg_surface_request(s, fake, msg)?,
         other => {
             info!("  unknown fake iface '{other}', oid={}", fake.cli_oid);
         }
@@ -885,6 +930,7 @@ fn handle_layer_shell_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) 
             // 4. Map the IDs for future event translation
             s.translation_map.push(TranslationEntry {
                 cli_layer_surface_oid: cli_layer_surf_id,
+                cli_xdg_surface_oid: 0,
                 comp_xdg_surface_oid: comp_xdg_surf_id,
                 comp_toplevel_oid: comp_toplevel_id,
                 cli_surface_oid: surface_id,
@@ -926,7 +972,59 @@ fn handle_layer_shell_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) 
     Ok(())
 }
 
-fn handle_layer_surface_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
+fn handle_xdg_surface_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
+    let op = msg.opcode();
+    let pay = &msg.raw[8..];
+    
+    let entry = s.translation_map.iter().find(|e| e.cli_xdg_surface_oid == fake.cli_oid).cloned();
+    let entry = match entry {
+        Some(e) => e,
+        None => return Ok(()),
+    };
+
+    match op {
+        0 => { // destroy
+            info!("  xdg_surface.destroy: alias oid={}", fake.cli_oid);
+            s.fake_objects.retain(|f| f.cli_oid != fake.cli_oid);
+        }
+        2 => { // get_popup(new_id, parent, positioner)
+            if pay.len() >= 12 {
+                let new_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+                let parent_id = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+                let pos_id = u32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]);
+                
+                info!("  Intercepted xdg_surface.get_popup: new_id={}, parent={}, pos={}", new_id, parent_id, pos_id);
+                
+                // We need to forward this to the REAL xdg_surface on the compositor.
+                // If parent_id matches any of our managed xdg_surfaces, we must translate it.
+                let mut real_parent = parent_id;
+                if let Some(p_entry) = s.translation_map.iter().find(|e| e.cli_xdg_surface_oid == parent_id) {
+                    real_parent = p_entry.comp_xdg_surface_oid;
+                }
+
+                let mut new_pay = Vec::new();
+                new_pay.extend_from_slice(&new_id.to_ne_bytes());
+                new_pay.extend_from_slice(&real_parent.to_ne_bytes());
+                new_pay.extend_from_slice(&pos_id.to_ne_bytes());
+                
+                send_raw(&s.to_comp, &RawMsg {
+                    raw: make_raw(entry.comp_xdg_surface_oid, 2, &new_pay),
+                    fds: Vec::new(),
+                })?;
+            }
+        }
+        4 => { // ack_configure(serial)
+            send_raw(&s.to_comp, &RawMsg {
+                raw: make_raw(entry.comp_xdg_surface_oid, 4, pay),
+                fds: Vec::new(),
+            })?;
+        }
+        _ => {
+            debug!("  xdg_surface (alias): ignored op={}", op);
+        }
+    }
+    Ok(())
+}
     let op = msg.opcode();
     let pay = &msg.raw[8..];
     
