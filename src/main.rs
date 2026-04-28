@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::Parser;
 use log::info;
 
-mod proxy;
+use wayland_2_gnome::proxy;
 
 #[derive(Parser)]
 #[command(name = "wayland-2-gnome", about = "Protocol-aware Wayland proxy translating wlr-layer-shell to GNOME Shell overlays")]
@@ -145,9 +145,9 @@ fn install_signal_handlers(_shutdown: Arc<AtomicBool>) -> Result<()> {
 
     // External C function that can be used as a sigaction handler
     extern "C" fn handle_signal(_sig: std::os::raw::c_int) {
-        // We can't safely access the Arc here because signal handlers are
-        // extremely constrained. Instead, use a static atomic.
-        SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
+        // Use the static atomic in the proxy module
+        // SAFETY: Signal handlers are extremely constrained; we use a static AtomicBool.
+        wayland_2_gnome::proxy::SHUTDOWN_FLAG.store(true, Ordering::SeqCst);
     }
 
     let handler = SigHandler::Handler(handle_signal);
@@ -162,6 +162,4 @@ fn install_signal_handlers(_shutdown: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
-/// Static flag used by the signal handler (signal handlers can't capture closures safely).
-/// pub(crate) so proxy::run_with_shutdown can read it.
-pub(crate) static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+

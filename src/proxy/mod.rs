@@ -6,9 +6,13 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use log::{debug, error, info, warn};
 
-/// Check whether the static shutdown flag has been set (by signal handlers in main.rs).
+/// Static flag set by signal handlers to request graceful shutdown.
+/// Lives in the proxy module so both the binary and tests can read it.
+pub static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
+
+/// Check whether the static shutdown flag has been set (by signal handlers).
 pub(crate) fn check_shutdown() -> bool {
-    super::SHUTDOWN_FLAG.load(std::sync::atomic::Ordering::SeqCst)
+    SHUTDOWN_FLAG.load(Ordering::SeqCst)
 }
 
 // ─── Wire message ───────────────────────────────────────────────────────────
@@ -33,7 +37,7 @@ impl RawMsg {
     }
 }
 
-fn make_raw(oid: u32, op: u16, pay: &[u8]) -> Vec<u8> {
+pub fn make_raw(oid: u32, op: u16, pay: &[u8]) -> Vec<u8> {
     let total = 8u32 + pay.len() as u32;
     let mut m = Vec::with_capacity(total as usize);
     m.extend_from_slice(&oid.to_ne_bytes());
