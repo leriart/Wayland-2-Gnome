@@ -1,24 +1,22 @@
-//! Wayland GNOME Bridge
+//! Wayland GNOME Bridge — Phase 2
 //!
-//! Phase 1: Raw proxy server.
-//! Listens on a Unix socket, accepts client connections,
-//! connects to the real Wayland compositor (GNOME Mutter),
-//! and proxies raw messages bidirectionally.
+//! Protocol-aware proxy using wayland_server + wayland_client.
+//! Sits between apps and GNOME Mutter, translating wlr-layer-shell
+//! into operations Mutter understands.
 
-use std::os::unix::net::UnixListener;
-use std::thread;
+use std::fs;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use log::{error, info};
+use wayland_server::{Display, ListeningSocket};
 
 mod proxy;
 
 /// Bridge configuration
 #[derive(Debug, Clone)]
 struct BridgeConfig {
-    /// Socket name (basename in $XDG_RUNTIME_DIR)
     socket_name: String,
-    /// Real compositor's display (e.g., "wayland-0")
     compositor_display: String,
 }
 
@@ -38,42 +36,37 @@ fn main() -> Result<()> {
     )
     .init();
 
-    let config = BridgeConfig::default();
+    let config = Arc::new(BridgeConfig::default());
     let socket_path = format!("{}/{}", socket_dir()?, config.socket_name);
 
     info!(
-        "Starting bridge on '{}', proxying to '{}'",
+        "Starting bridge Phase 2 on '{}', proxying to '{}'",
         socket_path, config.compositor_display
     );
 
     // Remove old socket if present
-    let _ = std::fs::remove_file(&socket_path);
+    let _ = fs::remove_file(&socket_path);
+    let _ = fs::remove_file(format!("{}.lock", &socket_path));
 
-    // Bind listener
-    let listener =
-        UnixListener::bind(&socket_path).context("Failed to bind socket")?;
-    info!("Listening on {socket_path}");
+    // Create the Wayland display (server side)
+    let display: Display<proxy::BridgeState> = Display::new()
+        .context("Failed to create Wayland display")?;
 
-    // Accept connections
-    for stream in listener.incoming() {
-        match stream {
-            Ok(client) => {
-                let display = config.compositor_display.clone();
-                thread::spawn(move || {
-                    if let Err(e) = proxy::handle_client(client, &display) {
-                        error!("Client handler: {e}");
-                    }
-                });
-            }
-            Err(e) => error!("Accept failed: {e}"),
-        }
-    }
+    // Bind the Unix socket using ListeningSocket utility
+    let socket = ListeningSocket::bind(&config.socket_name)
+        .context("Failed to bind socket")?;
+
+    info!(
+        "Server socket ready at {}",
+        socket_path
+    );
+
+    // Run the event loop — passes ownership of display and socket
+    proxy::run_event_loop(display, socket, config)?;
 
     Ok(())
 }
 
 fn socket_dir() -> Result<String> {
-    let dir = std::env::var("XDG_RUNTIME_DIR")
-        .context("XDG_RUNTIME_DIR is not set")?;
-    Ok(dir)
+    Ok(std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?)
 }
