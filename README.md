@@ -11,24 +11,12 @@ Wayland 2 GNOME acts as a protocol-aware layer between specialized Wayland apps 
 ### Desktop Integration
 The bridge allows background visualizers and panels to blend perfectly with the GNOME desktop environment.
 
-![Cava Visualizer on Desktop](Screenshot_20250125_195537.png)
-![Dynamic Background](Screenshot_20250125_195610.png)
-
 ### Interface Translation
 Complex panels and launchers are rendered without window borders, maintaining their original design intent.
 
-<p align="center">
-  <img src="Screenshot_20250125_200407.png" width="45%" />
-  <img src="Screenshot_20250125_200427.png" width="45%" />
-</p>
 
 ### Interactive Overlays
 Full support for popups and menus, ensuring tooltips and dropdowns function as expected.
-
-<p align="center">
-  <img src="Screenshot_20250125_201115.png" width="45%" />
-  <img src="Screenshot_20250125_201131.png" width="45%" />
-</p>
 
 ---
 
