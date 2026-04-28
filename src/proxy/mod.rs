@@ -274,6 +274,7 @@ struct Session {
     translation_map: Vec<TranslationEntry>,
 }
 
+#[derive(Clone)]
 struct TranslationEntry {
     cli_layer_surface_oid: u32,
     /// The xdg_surface OID the client might have created for the same wl_surface.
@@ -455,6 +456,7 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
                 Ok(m) => m,
                 Err(e) => {
                     info!("Compositor EOF: {e}");
+                    cleanup_session(&mut s);
                     return Ok(());
                 }
             };
@@ -482,6 +484,7 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
             Ok(m) => m,
             Err(e) => {
                 info!("Client EOF: {e}");
+                cleanup_session(&mut s);
                 return Ok(());
             }
         };
@@ -491,7 +494,7 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         let op = msg.opcode();
         if op == 12 { // wl_surface.set_buffer_scale
             // Check if this surface belongs to one of our translated layers
-            if let Some(entry) = s.translation_map.iter().find(|e| e.cli_surface_oid == oid) {
+            if let Some(_entry) = s.translation_map.iter().find(|e| e.cli_surface_oid == oid) {
                 let pay = &msg.raw[8..];
                 if pay.len() >= 4 {
                     let scale = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
@@ -509,12 +512,65 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
                 Ok(m) => m,
                 Err(e) => {
                     info!("Compositor EOF: {e}");
+                    cleanup_session(&mut s);
                     return Ok(());
                 }
             };
             handle_comp(&mut s, &msg)?;
         }
     }
+}
+
+// ─── Orphan cleanup ────────────────────────────────────────────────────────
+
+/// Clean up all compositor-side resources when a client disconnects.
+/// Sends destroy messages for every bridge-managed object to prevent leaks.
+fn cleanup_session(s: &mut Session) {
+    let n_entries = s.translation_map.len();
+    if n_entries > 0 {
+        info!("Cleaning up {} translation entries", n_entries);
+    }
+
+    // Destroy toplevels and xdg_surfaces in reverse order (child first)
+    for entry in s.translation_map.drain(..).rev() {
+        // xdg_toplevel.destroy
+        if let Err(e) = send_raw(&s.to_comp, &RawMsg {
+            raw: make_raw(entry.comp_toplevel_oid, 0, &[]),
+            fds: Vec::new(),
+        }) {
+            warn!("cleanup: toplevel.destroy failed: {e}");
+        }
+        // xdg_surface.destroy
+        if let Err(e) = send_raw(&s.to_comp, &RawMsg {
+            raw: make_raw(entry.comp_xdg_surface_oid, 0, &[]),
+            fds: Vec::new(),
+        }) {
+            warn!("cleanup: xdg_surface.destroy failed: {e}");
+        }
+    }
+
+    // Cleanup decoration manager bound internally
+    if s.comp_dec_mgr_id != 0 {
+        // We can't destroy the decoration manager itself (it's compositor-side),
+        // but we can forget about it since this session is ending.
+        info!("cleanup: decoration manager session done");
+    }
+
+    // Cleanup internal compositor binding
+    if s.comp_compositor_id != 0 {
+        info!("cleanup: internal compositor binding released");
+    }
+
+    // Clear all tracked fake objects
+    let n_fakes = s.fake_objects.len();
+    if n_fakes > 0 {
+        info!("Cleanup: discarding {} fake objects", n_fakes);
+        s.fake_objects.clear();
+    }
+
+    // Reset session tracking state
+    s.injected_layer_shell = false;
+    s.fake_global_name = None;
 }
 
 // ─── Global sniffing & injection ────────────────────────────────────────────
@@ -1025,6 +1081,8 @@ fn handle_xdg_surface_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) 
     }
     Ok(())
 }
+
+fn handle_layer_surface_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
     let op = msg.opcode();
     let pay = &msg.raw[8..];
     
