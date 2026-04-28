@@ -1,8 +1,15 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use log::{debug, error, info, warn};
+
+/// Check whether the static shutdown flag has been set (by signal handlers in main.rs).
+pub(crate) fn check_shutdown() -> bool {
+    super::SHUTDOWN_FLAG.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 // ─── Wire message ───────────────────────────────────────────────────────────
 
@@ -293,6 +300,12 @@ struct TranslationEntry {
 // ─── Public entry point ─────────────────────────────────────────────────────
 
 pub fn run(cfg: BridgeConfig) -> Result<()> {
+    run_with_shutdown(cfg, Arc::new(AtomicBool::new(false)))
+}
+
+/// Run the bridge with a shared shutdown signal (for daemon mode).
+/// When `shutdown` is set to true, the accept loop exits gracefully.
+pub fn run_with_shutdown(cfg: BridgeConfig, shutdown: Arc<AtomicBool>) -> Result<()> {
     let rdir = std::env::var("XDG_RUNTIME_DIR")
         .unwrap_or_else(|_| "/run/user/1000".to_string());
     let spath = format!("{rdir}/{}", cfg.bridge_display);
@@ -310,6 +323,12 @@ pub fn run(cfg: BridgeConfig) -> Result<()> {
     );
 
     loop {
+        // Check graceful shutdown signal (from passed Arc or static signal handler)
+        if shutdown.load(Ordering::Relaxed) || check_shutdown() {
+            info!("Shutdown signal received, stopping listener");
+            break;
+        }
+
         let (cli, _) = match lis.accept() {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -318,7 +337,7 @@ pub fn run(cfg: BridgeConfig) -> Result<()> {
             }
             Err(e) => {
                 error!("Accept: {e}");
-                break Ok(());
+                break;
             }
         };
         cli.set_nonblocking(false)?;
@@ -326,6 +345,7 @@ pub fn run(cfg: BridgeConfig) -> Result<()> {
 
         let comp_display = cfg.compositor_display.clone();
         let rd2 = rdir.clone();
+        let sh = shutdown.clone();
 
         std::thread::Builder::new()
             .name("client-session".into())
@@ -341,11 +361,19 @@ pub fn run(cfg: BridgeConfig) -> Result<()> {
                 };
                 comp.set_nonblocking(false).ok();
                 if let Err(e) = session(cli, comp) {
-                    error!("Session error: {e}");
+                    // Don't log shutdown-triggered errors as errors
+                    if !sh.load(Ordering::Relaxed) {
+                        error!("Session error: {e}");
+                    }
                 }
                 info!("Session done");
             })?;
     }
+
+    // Clean up socket file
+    let _ = std::fs::remove_file(&spath);
+    info!("Socket {spath} removed");
+    Ok(())
 }
 
 // ─── Config ─────────────────────────────────────────────────────────────────
