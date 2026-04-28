@@ -1,6 +1,6 @@
 # Maintainer: Leriart <leriart@users.noreply.github.com>
 pkgname=wayland-2-gnome
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Protocol-aware Wayland proxy translating wlr-layer-shell to GNOME Shell overlays"
 arch=('x86_64')

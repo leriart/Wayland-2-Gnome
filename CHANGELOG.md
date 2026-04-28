@@ -5,6 +5,14 @@ All notable changes to Wayland 2 GNOME are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-04-28
+
+### Added
+
+- **Phase 1 -- Dynamic multi-monitor**: TrackedOutput struct for wl_output geometry tracking. Post-collect global detection forwards new wl_output globals to clients dynamically. `sniff_output_event()` intercepts geometry changes for multi-monitor awareness.
+- **Phase 2 -- Input re-injection**: MonitorInfo struct tracks display geometry and scale. `wl_pointer.motion` and `wl_pointer.enter` coordinates are offset by monitor origin bidirectionally, ensuring correct pointer positioning across multiple monitors.
+- **Phase 3 -- Auto-install service**: `--install` flag writes `~/.config/systemd/user/wayland-2-gnome.service` with current `--socket` and `--compositor`, runs systemctl daemon-reload and enable, then exits.
+
 ## [0.1.1] — 2026-04-28
 
 ### Fixed
