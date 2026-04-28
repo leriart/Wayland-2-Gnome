@@ -31,6 +31,10 @@ struct Cli {
     /// Path to TOML config file
     #[arg(long)]
     config: Option<String>,
+
+    /// Install systemd user service and exit
+    #[arg(long)]
+    install: bool,
 }
 
 fn main() -> Result<()> {
@@ -40,6 +44,12 @@ fn main() -> Result<()> {
     .init();
 
     let cli = Cli::parse();
+    // --install: auto-install systemd user service
+    if cli.install {
+        return install_systemd_user_service(&cli.socket, &cli.compositor, cli.config.as_deref());
+    }
+
+    // Daemonize BEFORE signal setup to avoid issues with threaded env_logger
 
     // Daemonize BEFORE signal setup to avoid issues with threaded env_logger
     if cli.daemon {
@@ -99,7 +109,69 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Fork into background, create new session, redirect stdio, write PID file.
+/// Install systemd --user service unit and enable it.
+fn install_systemd_user_service(socket: &str, compositor: &str, config_path: Option<&str>) -> Result<()> {
+    let home = std::env::var("HOME").map_err(|_| anyhow::anyhow!("HOME not set"))?;
+    let systemd_dir = format!("{home}/.config/systemd/user");
+    let service_path = format!("{systemd_dir}/wayland-2-gnome.service");
+
+    std::fs::create_dir_all(&systemd_dir)?;
+    eprintln!("  [1/4] Created {systemd_dir}");
+
+    let service_content = format!(
+        r###"[Unit]
+Description=Wayland 2 GNOME protocol bridge (wlr-layer-shell -> GNOME)
+Documentation=https://github.com/SrGcorp/Wayland-2-Gnome
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/wayland-2-gnome --socket {socket} --compositor {compositor}{config_opt}
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target
+"###,
+        socket = socket,
+        compositor = compositor,
+        config_opt = config_path.map(|p| format!(" --config {p}")).unwrap_or_default()
+    );
+
+    std::fs::write(&service_path, service_content)?;
+    eprintln!("  [2/4] Wrote {service_path}");
+
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("systemctl --user daemon-reload failed (exit {status:?})");
+    }
+    eprintln!("  [3/4] systemctl --user daemon-reload OK");
+
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "wayland-2-gnome.service"])
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("systemctl --user enable failed (exit {status:?})");
+    }
+    eprintln!("  [4/4] systemctl --user enable OK");
+
+    eprintln!();
+    eprintln!("Service installed. Start it with:");
+    eprintln!("  systemctl --user start wayland-2-gnome.service");
+    eprintln!();
+    eprintln!("Check status:");
+    eprintln!("  systemctl --user status wayland-2-gnome.service");
+    eprintln!();
+    eprintln!("View logs:");
+    eprintln!("  journalctl --user -u wayland-2-gnome.service -f");
+
+    Ok(())
+}
+
 fn daemonize() -> Result<()> {
     use nix::unistd::{fork, ForkResult};
 
