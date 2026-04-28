@@ -6,8 +6,6 @@ Wayland 2 GNOME acts as a protocol-aware layer between specialized Wayland apps 
 
 ---
 
-## Visual Demo
-
 ### Desktop Integration
 The bridge allows background visualizers and panels to blend perfectly with the GNOME desktop environment.
 
