@@ -1,0 +1,41 @@
+# Maintainer: Your Name <you@example.com>
+pkgname=wayland-2-gnome
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Protocol-aware Wayland proxy translating wlr-layer-shell to GNOME Shell overlays"
+arch=('x86_64')
+url="https://github.com/leriart/Wayland-2-Gnome"
+license=('MIT')
+depends=('glibc')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/leriart/$pkgname/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/$pkgname-$pkgver"
+  cargo build --release --locked
+}
+
+check() {
+  cd "$srcdir/$pkgname-$pkgver"
+  cargo test --release
+}
+
+package() {
+  cd "$srcdir/$pkgname-$pkgver"
+
+  # Binary
+  install -Dm755 target/release/wayland-2-gnome "$pkgdir/usr/bin/wayland-2-gnome"
+
+  # Systemd user service
+  install -Dm644 release/pkg/systemd/wayland-2-gnome.service \
+    "$pkgdir/usr/lib/systemd/user/wayland-2-gnome.service"
+
+  # Autostart
+  install -Dm644 release/autostart/wayland-2-gnome.desktop \
+    "$pkgdir/etc/xdg/autostart/wayland-2-gnome.desktop"
+
+  # Documentation
+  install -Dm644 README.md "$pkgdir/usr/share/doc/wayland-2-gnome/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/wayland-2-gnome/LICENSE"
+}
