@@ -1596,7 +1596,7 @@ fn handle_layer_surface_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg
         }
         5 => {
             // get_popup(popup)
-            info!("  Layer get_popup: Client requested a popup for layer_surface {}", fake.cli_oid);
+            info!("  Layer get_popup (op 5) ignored on layer_surface {}", fake.cli_oid);
         }
         6 => {
             // ack_configure(serial)
