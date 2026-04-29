@@ -205,7 +205,7 @@ fn daemonize() -> Result<()> {
             nix::unistd::setsid()?;
 
             // Redirect stdin/stdout/stderr to /dev/null
-            let null = std::fs::File::open("/dev/null")?;
+            let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null")?;
             let null_fd = null.as_raw_fd();
             unsafe {
                 libc::dup2(null_fd, 0); // stdin

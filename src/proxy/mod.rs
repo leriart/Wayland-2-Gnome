@@ -396,6 +396,7 @@ struct MonitorInfo {
     width_mm: i32,
     height_mm: i32,
     scale: i32,
+    name: Option<String>,
 }
 
 fn forward_output_global(s: &mut Session, name: u32, iface: &str, version: u32) -> Result<()> {
@@ -428,11 +429,21 @@ fn sniff_output_event(s: &mut Session, oid: u32, op: u16, pay: &[u8]) {
             // Track this new monitor
             s.monitors.push(MonitorInfo {
                 comp_oid: oid,
-                x, y, width_mm: w, height_mm: h, scale: 1,
+                x, y, width_mm: w, height_mm: h, scale: 1, name: None,
             });
         }
     }
     // Scale event (op 6): factor (int, actually encoded as wl_fixed_t which is i32)
+    if op == 4 && pay.len() >= 4 {
+        let slen = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]) as usize;
+        if pay.len() >= 4 + slen {
+            let name = String::from_utf8_lossy(&pay[4..4+slen]).trim_end_matches('\0').to_string();
+            if let Some(mon) = s.monitors.iter_mut().find(|m| m.comp_oid == oid) {
+                mon.name = Some(name);
+            }
+        }
+    }
+
     if op == 6 && pay.len() >= 4 {
         let scale = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
         if let Some(mon) = s.monitors.iter_mut().find(|m| m.comp_oid == oid) {
@@ -1023,51 +1034,6 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         }
     }
 
-    // Input re-injection: offset wl_pointer and wl_keyboard events
-    // by the origin monitor coordinates so that translated surfaces
-    // receive correct global positions.
-    if s.monitors.len() > 1 {
-        // wl_pointer.motion (op 0): surface_x(wl_fixed), surface_y(wl_fixed)
-        if msg.opcode() == 0 && msg.raw.len() >= 16 {
-            let pay = &msg.raw[8..];
-            let surf_x = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-            let surf_y = i32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
-            // Add offset of the first known monitor (closest to origin)
-            let ox = s.monitors[0].x;
-            let oy = s.monitors[0].y;
-            let new_x = surf_x.wrapping_add(ox);
-            let new_y = surf_y.wrapping_add(oy);
-            if ox != 0 || oy != 0 {
-                debug!("  Input offset: wl_pointer.motion ({}x{}) -> ({}x{})", surf_x, surf_y, new_x, new_y);
-            }
-            let mut new_pay = msg.raw[..8].to_vec();
-            new_pay.extend_from_slice(&new_x.to_ne_bytes());
-            new_pay.extend_from_slice(&new_y.to_ne_bytes());
-            let rem = &pay[8..]; // states array follows
-            new_pay.extend_from_slice(rem);
-            return send_raw(&s.to_comp, &RawMsg { raw: new_pay, fds: Vec::new() });
-        }
-        // wl_pointer.enter (op 1): serial, surface, surface_x, surface_y
-        if msg.opcode() == 1 && msg.raw.len() >= 24 {
-            let pay = &msg.raw[8..];
-            let serial = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-            let surface_oid = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
-            let surf_x = i32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]);
-            let surf_y = i32::from_ne_bytes([pay[12], pay[13], pay[14], pay[15]]);
-            let ox = s.monitors[0].x;
-            let oy = s.monitors[0].y;
-            let new_x = surf_x.wrapping_add(ox);
-            let new_y = surf_y.wrapping_add(oy);
-            let mut new_pay = Vec::with_capacity(24);
-            new_pay.extend_from_slice(&serial.to_ne_bytes());
-            new_pay.extend_from_slice(&surface_oid.to_ne_bytes());
-            new_pay.extend_from_slice(&new_x.to_ne_bytes());
-            new_pay.extend_from_slice(&new_y.to_ne_bytes());
-            let rem = &pay[16..];
-            new_pay.extend_from_slice(rem);
-            return send_raw(&s.to_comp, &RawMsg { raw: make_raw(oid, 1, &new_pay), fds: Vec::new() });
-        }
-    }
 
     // Everything else: forward raw
     send_raw(&s.to_comp, msg)
@@ -1253,8 +1219,13 @@ fn handle_xdg_output_manager_request(s: &mut Session, fake: &FakeObject, msg: &R
                 fds: Vec::new(),
             })?;
 
-            // Send output_name("wayland-2-gnome") — op 4
-            let name = "wayland-2-gnome\0";
+            // Send output_name — op 4
+            let output_name_str = s.monitors.iter()
+                .find(|m| m.comp_oid == output_oid)
+                .and_then(|m| m.name.clone())
+                .unwrap_or_else(|| format!("wayland-bridge-{}", output_oid));
+            let mut name = output_name_str;
+            name.push('\0');
             let name_slen = name.len() as u32;
             let name_padded = ((name_slen as usize) + 3) & !3;
             let mut name_pay = Vec::with_capacity(4 + name_padded);
@@ -1747,46 +1718,6 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
         }
     }
 
-    // Reverse input offset: when compositor sends wl_pointer events back
-    // to client, un-offset the coordinates by the monitor origin.
-    if s.monitors.len() > 1 {
-        // wl_pointer.motion (op 0) from compositor: subtract offset
-        if oid != 1 && msg.opcode() == 0 && msg.raw.len() >= 16 {
-            let pay = &msg.raw[8..];
-            let surf_x = i32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-            let surf_y = i32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
-            let ox = s.monitors[0].x;
-            let oy = s.monitors[0].y;
-            let new_x = surf_x.wrapping_sub(ox);
-            let new_y = surf_y.wrapping_sub(oy);
-            let mut new_pay = msg.raw[..8].to_vec();
-            new_pay.extend_from_slice(&new_x.to_ne_bytes());
-            new_pay.extend_from_slice(&new_y.to_ne_bytes());
-            let rem = &pay[8..];
-            new_pay.extend_from_slice(rem);
-            return send_raw(&s.to_cli, &RawMsg { raw: new_pay, fds: Vec::new() });
-        }
-        // wl_pointer.enter (op 1) from compositor
-        if oid != 1 && msg.opcode() == 1 && msg.raw.len() >= 24 {
-            let pay = &msg.raw[8..];
-            let serial = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-            let surface_oid = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
-            let surf_x = i32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]);
-            let surf_y = i32::from_ne_bytes([pay[12], pay[13], pay[14], pay[15]]);
-            let ox = s.monitors[0].x;
-            let oy = s.monitors[0].y;
-            let new_x = surf_x.wrapping_sub(ox);
-            let new_y = surf_y.wrapping_sub(oy);
-            let mut new_pay = Vec::with_capacity(24);
-            new_pay.extend_from_slice(&serial.to_ne_bytes());
-            new_pay.extend_from_slice(&surface_oid.to_ne_bytes());
-            new_pay.extend_from_slice(&new_x.to_ne_bytes());
-            new_pay.extend_from_slice(&new_y.to_ne_bytes());
-            let rem = &pay[16..];
-            new_pay.extend_from_slice(rem);
-            return send_raw(&s.to_cli, &RawMsg { raw: make_raw(oid, 1, &new_pay), fds: Vec::new() });
-        }
-    }
 
     debug!("comp -> cli: oid={}, op={}, size={} raw={:02x?}", oid, msg.opcode(), msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
 
