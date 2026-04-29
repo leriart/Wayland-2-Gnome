@@ -1133,14 +1133,20 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     if iface == "xdg_wm_base" {
         s.cli_xdg_wm_base_id = new_id;
         info!("  identified xdg_wm_base at cli_oid={new_id}");
-        // Mutter has a bug where it rejects xdg_wm_base v7 binds on
-        // secondary registries. Always clamp to v6 (which works).
-        if cli_version > 6 {
-            info!("  clamping xdg_wm_base v{} to v6 (Mutter secondary registry workaround)", cli_version);
-            let mut clamped = msg.raw.clone();
-            let raw_ver_offset = 8 + 8 + str_padded;
-            clamped[raw_ver_offset..raw_ver_offset+4].copy_from_slice(&6u32.to_ne_bytes());
-            return send_raw_raw(&s.to_comp, clamped, &msg.fds);
+        // Intercept xdg_wm_base on tertiary registries and forward via primary.
+        if s.cli_reg_id > 10 {
+            info!("  intercepting xdg_wm_base on tertiary registry -> forwarding via primary oid={}", s.cli_xdg_wm_base_id);
+            // Create fake object to forward requests to primary xdg_wm_base
+            if !s.fake_objects.iter().any(|f| f.cli_oid == new_id) && new_id > 0 {
+                let primary_oid = s.cli_xdg_wm_base_id;
+                s.fake_objects.push(FakeObject {
+                    cli_oid: new_id,
+                    iface: "xdg_wm_base".into(),
+                    next_sub_oid: new_id + 1,
+                    data: primary_oid.to_string(),
+                });
+            }
+            return Ok(());
         }
     }
 
@@ -1177,11 +1183,22 @@ fn handle_fake_msg(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<(
         "xdg_surface" => handle_xdg_surface_request(s, fake, msg)?,
         "zxdg_output_manager_v1" => handle_xdg_output_manager_request(s, fake, msg)?,
         "zxdg_output_v1" => handle_xdg_output_request(s, fake, msg)?,
+        "xdg_wm_base" => handle_xdg_wm_base_forward(s, fake, msg)?,
         other => {
             info!("  unknown fake iface '{other}', oid={}", fake.cli_oid);
         }
     }
     Ok(())
+}
+
+/// Forward xdg_wm_base requests from a remapped xdg_wm_base to the real compositor OID.
+fn handle_xdg_wm_base_forward(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
+    if let Ok(real_oid) = fake.data.parse::<u32>() {
+        let mut rewritten = msg.raw.clone();
+        rewritten[0..4].copy_from_slice(&real_oid.to_ne_bytes());
+        return send_raw_raw(&s.to_comp, rewritten, &msg.fds);
+    }
+    send_raw(&s.to_comp, msg)
 }
 
 // ─── xdg-output handler ────────────────────────────────────────────────────
