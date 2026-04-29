@@ -1102,8 +1102,19 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
         u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]])
     };
 
-    // Always intercept binds to our fake injected global (name=1000),
-    // whether it's the first bind or repeated binds from SCT internals.
+    // Extract the interface string from the wire message so we can check it
+    // before looking up the global (needed for intercepted globals).
+    let iface_from_wire: Option<String> = {
+        let slen = str_len_raw as usize;
+        if slen > 0 && slen < 256 && 8 + slen <= pay.len() {
+            let s = String::from_utf8_lossy(&pay[8..8 + slen]).trim_end_matches('\0').to_string();
+            Some(s)
+        } else {
+            None
+        }
+    };
+
+    // Always intercept binds to our fake injected global (name=1000).
     if global_name == FAKE_GLOBAL_LAYER_SHELL {
         info!("  🎣 intercepted fake bind for zwlr_layer_shell_v1 → cli_oid={new_id}");
         let already_tracked = s.fake_objects.iter().any(|f| f.cli_oid == new_id);
@@ -1111,6 +1122,25 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.fake_objects.push(FakeObject {
                 cli_oid: new_id,
                 iface: "zwlr_layer_shell_v1".into(),
+                next_sub_oid: new_id + 1,
+                data: String::new(),
+            });
+        }
+        return Ok(());
+    }
+
+    // Intercept zxdg_output_manager_v1 when it's NOT available from the
+    // compositor (e.g. Mutter/GNOME). We detect this by checking if the
+    // compositor has it in its globals. If it does (Hyprland), forward it.
+    // If it doesn't (Mutter), intercept and serve synthetic events.
+    let comp_has_zxdg_output = s.comp_globals.iter().any(|g| g.interface == "zxdg_output_manager_v1");
+    if iface_from_wire.as_deref() == Some("zxdg_output_manager_v1") && !comp_has_zxdg_output {
+        info!("  🎣 intercepted bind for zxdg_output_manager_v1 → cli_oid={new_id} (compositor doesn't have it)");
+        let already_tracked = s.fake_objects.iter().any(|f| f.cli_oid == new_id);
+        if !already_tracked {
+            s.fake_objects.push(FakeObject {
+                cli_oid: new_id,
+                iface: "zxdg_output_manager_v1".into(),
                 next_sub_oid: new_id + 1,
                 data: String::new(),
             });
@@ -1136,10 +1166,9 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     }
 
     // ⚠ Safety check: if the client is binding a global that doesn't exist
-    // in the compositor's actual list (not counting our injected globals),
-    // do NOT forward it — the compositor will reject it and disconnect.
-    let is_real_global = s.comp_globals.iter().any(|g| g.name == global_name && g.interface != "zwlr_layer_shell_v1");
-    if global_name != FAKE_GLOBAL_LAYER_SHELL && !is_real_global {
+    // in the compositor's actual list, do NOT forward it — the compositor
+    // will reject it and disconnect. Only skip the fake injected global (1000).
+    if global_name != FAKE_GLOBAL_LAYER_SHELL && !s.comp_globals.iter().any(|g| g.name == global_name) {
         warn!("  ⚠ intercepted bind to unknown global name={}, iface='{}' — preventing compositor error", global_name, iface);
         return Ok(());
     }
@@ -1167,8 +1196,106 @@ fn handle_fake_msg(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<(
         "zwlr_layer_shell_v1" => handle_layer_shell_request(s, fake, msg)?,
         "zwlr_layer_surface_v1" => handle_layer_surface_request(s, fake, msg)?,
         "xdg_surface" => handle_xdg_surface_request(s, fake, msg)?,
+        "zxdg_output_manager_v1" => handle_xdg_output_manager_request(s, fake, msg)?,
+        "zxdg_output_v1" => handle_xdg_output_request(s, fake, msg)?,
         other => {
             info!("  unknown fake iface '{other}', oid={}", fake.cli_oid);
+        }
+    }
+    Ok(())
+}
+
+// ─── xdg-output handler ────────────────────────────────────────────────────
+
+/// Handle requests on the fake zxdg_output_manager_v1 object.
+/// Protocol:
+///   op 0: destroy()
+///   op 1: get_xdg_output(new_id, output)
+fn handle_xdg_output_manager_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
+    let op = msg.opcode();
+    match op {
+        0 => {
+            // destroy — noop, just forget the object
+            info!("  zxdg_output_manager_v1.destroy");
+        }
+        1 => {
+            // get_xdg_output(new_id, output)
+            let pay = &msg.raw[8..];
+            if pay.len() < 8 {
+                info!("  get_xdg_output payload too short");
+                return Ok(());
+            }
+            let xdg_out_new_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+            let output_oid = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+            info!("  Intercepted get_xdg_output: new_id={xdg_out_new_id}, output_oid={output_oid}");
+
+            // Track this xdg_output as a fake object
+            s.fake_objects.push(FakeObject {
+                cli_oid: xdg_out_new_id,
+                iface: "zxdg_output_v1".into(),
+                next_sub_oid: xdg_out_new_id + 1,
+                data: String::new(),
+            });
+
+            // Now send synthetic xdg_output events to the client so it doesn't hang.
+            // Logical position from our monitor tracking:
+            let (lx, ly) = s.monitors.iter()
+                .find(|m| m.comp_oid == output_oid)
+                .map(|m| (m.x, m.y))
+                .unwrap_or((0, 0));
+
+            // Send logical_position(x, y) — op 2
+            let mut pos_pay = Vec::with_capacity(8);
+            pos_pay.extend_from_slice(&lx.to_ne_bytes());
+            pos_pay.extend_from_slice(&ly.to_ne_bytes());
+            send_raw(&s.to_cli, &RawMsg {
+                raw: make_raw(xdg_out_new_id, 2, &pos_pay),
+                fds: Vec::new(),
+            })?;
+
+            // Send output_name("wayland-2-gnome") — op 4
+            let name = "wayland-2-gnome\0";
+            let name_slen = name.len() as u32;
+            let name_padded = ((name_slen as usize) + 3) & !3;
+            let mut name_pay = Vec::with_capacity(4 + name_padded);
+            name_pay.extend_from_slice(&name_slen.to_ne_bytes());
+            name_pay.extend_from_slice(name.as_bytes());
+            while name_pay.len() < (4 + name_padded) {
+                name_pay.push(0);
+            }
+            send_raw(&s.to_cli, &RawMsg {
+                raw: make_raw(xdg_out_new_id, 4, &name_pay),
+                fds: Vec::new(),
+            })?;
+
+            // Send done(serial) — op 1 (required to complete the xdg_output round-trip)
+            let done_pay = 1u32.to_ne_bytes(); // serial=1
+            send_raw(&s.to_cli, &RawMsg {
+                raw: make_raw(xdg_out_new_id, 1, &done_pay),
+                fds: Vec::new(),
+            })?;
+
+            info!("  Injected synthetic xdg_output events: logical_position({lx},{ly}), output_name='wayland-2-gnome'");
+        }
+        _ => {
+            info!("  unknown zxdg_output_manager_v1 op={}", op);
+        }
+    }
+    Ok(())
+}
+
+/// Handle requests on a fake zxdg_output_v1 object.
+/// Protocol:
+///   op 0: destroy()
+fn handle_xdg_output_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<()> {
+    let op = msg.opcode();
+    match op {
+        0 => {
+            // destroy — noop
+            info!("  zxdg_output_v1.destroy oid={}", fake.cli_oid);
+        }
+        _ => {
+            info!("  unknown zxdg_output_v1 op={}", op);
         }
     }
     Ok(())
