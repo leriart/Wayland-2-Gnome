@@ -1101,8 +1101,14 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let global = s.comp_globals.iter().find(|g| g.name == global_name);
     let iface = global.map(|g| g.interface.as_str()).unwrap_or("?");
     let comp_version = global.map(|g| g.version).unwrap_or(1);
-    let cli_version = u32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]);
-    info!("bind: name={global_name}, new_id={new_id}, iface={iface}, cli_v={cli_version}, comp_v={comp_version}");
+    let cli_version = if pay.len() >= 12 {
+        u32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]])
+    } else {
+        info!("  bind payload only {} bytes, no version field — setting default v1", pay.len());
+        1
+    };
+    let msg_size = msg.raw.len();
+    info!("bind: name={global_name}, new_id={new_id}, iface={iface}, cli_v={cli_version}, comp_v={comp_version}, msg_size={msg_size}, raw={:02x?}", &msg.raw[..msg_size.min(32)]);
 
     if iface == "xdg_wm_base" {
         s.cli_xdg_wm_base_id = new_id;
