@@ -1080,7 +1080,24 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     }
 
     let global_name = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-    let new_id = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+
+    // Wayland wire format for wl_registry.bind:
+    //   name(u32) | interface_string(4+len+padded) | version(u32) | new_id(u32)
+    // The interface string has a 4-byte length header followed by the
+    // string + nul + padding to next multiple of 4.
+    let str_len_raw = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+    let str_len = str_len_raw as usize;
+    let str_padded = (str_len + 3) & !3;
+    let str_offset = 8; // 4(name) + 4(str_len)
+    let ver_offset = str_offset + str_padded;
+    let new_id_offset = ver_offset + 4;
+
+    let new_id = if new_id_offset + 4 <= pay.len() {
+        u32::from_ne_bytes([pay[new_id_offset], pay[new_id_offset+1], pay[new_id_offset+2], pay[new_id_offset+3]])
+    } else {
+        warn!("  bind payload too short for new_id (needs {} bytes, has {})", new_id_offset + 4, pay.len());
+        u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]])
+    };
 
     // Always intercept binds to our fake injected global (name=1000),
     // whether it's the first bind or repeated binds from SCT internals.
@@ -1101,14 +1118,14 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let global = s.comp_globals.iter().find(|g| g.name == global_name);
     let iface = global.map(|g| g.interface.as_str()).unwrap_or("?");
     let comp_version = global.map(|g| g.version).unwrap_or(1);
-    let cli_version = if pay.len() >= 12 {
-        u32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]])
+    let cli_version = if ver_offset + 4 <= pay.len() {
+        u32::from_ne_bytes([pay[ver_offset], pay[ver_offset+1], pay[ver_offset+2], pay[ver_offset+3]])
     } else {
         info!("  bind payload only {} bytes, no version field — setting default v1", pay.len());
         1
     };
     let msg_size = msg.raw.len();
-    info!("bind: name={global_name}, new_id={new_id}, iface={iface}, cli_v={cli_version}, comp_v={comp_version}, msg_size={msg_size}, raw={:02x?}", &msg.raw[..msg_size.min(32)]);
+    info!("bind: name={global_name}, new_id={new_id}, iface={iface}, cli_v={cli_version}, comp_v={comp_version}, msg_size={msg_size}, raw={:02x?}", &msg.raw[..msg_size.min(40)]);
 
     if iface == "xdg_wm_base" {
         s.cli_xdg_wm_base_id = new_id;
@@ -1127,12 +1144,13 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     // Clamp version: if the client requests a version higher than what the
     // compositor supports, Mutter rejects the bind with "invalid arguments".
     // We must cap cli_version to comp_version before forwarding.
+    // The version is at offset 8+str_padded (after name(4) + str_len(4) + string(str_padded)).
     if cli_version > comp_version {
         info!("  clamping bind version {} -> {} for {} (compositor only supports up to v{})",
             cli_version, comp_version, iface, comp_version);
         let mut clamped = msg.raw.clone();
-        let ver_offset = 8 + 8; // skip OID/op/size(8) + name+new_id(8)
-        clamped[ver_offset..ver_offset+4].copy_from_slice(&comp_version.to_ne_bytes());
+        let raw_ver_offset = 8 + 8 + str_padded; // msg.raw[8+8+str_padded]
+        clamped[raw_ver_offset..raw_ver_offset+4].copy_from_slice(&comp_version.to_ne_bytes());
         return send_raw_raw(&s.to_comp, clamped, &msg.fds);
     }
 
