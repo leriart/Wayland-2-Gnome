@@ -5,6 +5,21 @@ All notable changes to Wayland 2 GNOME are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.5] - 2026-04-29
+
+### Fixed
+- **Correct wire format for `wl_registry.bind` parsing** — the actual
+  Wayland wire format has the interface **string** between `name` and
+  `version`/`new_id`, not a flat `name | new_id | version` layout.
+  The bridge now correctly decodes the variable-length interface string
+  to locate the version and new_id fields.
+- **Clamp offset fixed** — the clamping byte-write targeted the wrong
+  position (was writing over the string header instead of the version
+  field). Now correctly writes the clamped version at the right offset
+  after the interface string.
+- **Raw debug logging extended** to dump up to 40 bytes on each bind
+  message for diagnosing remaining wire format issues.
+
 ## [0.1.4] - 2026-04-28
 
 ### Fixed
