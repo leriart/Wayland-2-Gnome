@@ -695,7 +695,10 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
                     if let Err(e) = maybe_inject_layer_shell(session) {
                         error!("Inject layer shell: {e}");
                     }
-                    info!("globals collected: {} total", session.comp_globals.len());
+                    info!("globals collected ({}):", session.comp_globals.len());
+                    for g in &session.comp_globals {
+                        info!("  name={}, iface='{}', v{}", g.name, g.interface, g.version);
+                    }
                     // Forward this message to client too
                     let _ = send_raw(&session.to_cli, &msg);
                 }
@@ -1125,7 +1128,7 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
         1
     };
     let msg_size = msg.raw.len();
-    info!("bind: name={global_name}, new_id={new_id}, iface={iface}, cli_v={cli_version}, comp_v={comp_version}, msg_size={msg_size}, raw={:02x?}", &msg.raw[..msg_size.min(40)]);
+    info!("bind: name={global_name}, new_id={new_id}, iface={iface}, cli_v={cli_version}, comp_v={comp_version}, msg_size={msg_size}, raw={:02x?}", &msg.raw[..msg_size.min(56)]);
 
     if iface == "xdg_wm_base" {
         s.cli_xdg_wm_base_id = new_id;
