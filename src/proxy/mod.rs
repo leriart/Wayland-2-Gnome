@@ -960,11 +960,66 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         info!("get_registry → cli_reg={new_id}, comp_reg={new_id}");
         s.cli_reg_id = new_id;
         s.comp_reg_id = new_id;
+        // Inject fake layer_shell global BEFORE compositor globals arrive
+        info!("Injecting fake layer_shell global (name={}) on registry id={}", FAKE_GLOBAL_LAYER_SHELL, new_id);
+        let evt = make_global_event(
+            new_id,
+            FAKE_GLOBAL_LAYER_SHELL,
+            LAYER_SHELL_IFACE,
+            LAYER_SHELL_VERSION,
+        );
+        let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
+        s.injected_layer_shell = true;
+        s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
         send_raw(&s.to_comp, msg)?;
         return Ok(());
     }
 
-    // Registry bind — check if it's for our injected global
+    // Intercept binds for fake layer_shell on ANY registry
+    if oid != 1 && msg.opcode() == 0 && msg.raw.len() >= 28 {
+        let bind_name = u32::from_ne_bytes([msg.raw[8], msg.raw[9], msg.raw[10], msg.raw[11]]);
+        
+        // Intercept fake layer_shell bind
+        if bind_name == FAKE_GLOBAL_LAYER_SHELL {
+            info!("  intercepted fake bind for zwlr_layer_shell_v1 on any registry (oid={})", oid);
+            let str_len = u32::from_ne_bytes([msg.raw[12], msg.raw[13], msg.raw[14], msg.raw[15]]) as usize;
+            let str_padded = (str_len + 3) & !3;
+            let new_id_offset = 16 + str_padded + 4;
+            let new_id = if new_id_offset + 4 <= msg.raw.len() {
+                u32::from_ne_bytes([msg.raw[new_id_offset], msg.raw[new_id_offset+1], msg.raw[new_id_offset+2], msg.raw[new_id_offset+3]])
+            } else { 0 };
+            if new_id > 0 && !s.fake_objects.iter().any(|f| f.cli_oid == new_id) {
+                s.fake_objects.push(FakeObject { cli_oid: new_id, iface: "zwlr_layer_shell_v1".into(), next_sub_oid: new_id + 1, data: String::new() });
+            }
+            return Ok(());
+        }
+        
+        // Intercept zxdg_output_manager ONLY if the compositor doesn't have it.
+        // GNOME has it, so we let it through (compositor provides real events).
+        if bind_name == 5 && !s.comp_globals.iter().any(|g| g.interface == "zxdg_output_manager_v1") {
+            let str_len = u32::from_ne_bytes([msg.raw[12], msg.raw[13], msg.raw[14], msg.raw[15]]) as usize;
+            let str_padded = (str_len + 3) & !3;
+            let new_id_offset = 16 + str_padded + 4;
+            if new_id_offset + 4 <= msg.raw.len() {
+                let out_mgr_id = u32::from_ne_bytes([msg.raw[new_id_offset], msg.raw[new_id_offset+1], msg.raw[new_id_offset+2], msg.raw[new_id_offset+3]]);
+                if !s.fake_objects.iter().any(|f| f.cli_oid == out_mgr_id) {
+                    s.fake_objects.push(FakeObject { cli_oid: out_mgr_id, iface: "zxdg_output_manager_v1".into(), next_sub_oid: out_mgr_id + 1, data: String::new() });
+                    info!("  intercepted zxdg_output_manager_v1 at cli_oid={} (early bind)", out_mgr_id);
+                }
+            }
+            return Ok(());
+        }
+        
+        // NOTE: xdg_wm_base tracking is handled by handle_bind for primary registries.
+        
+        // Block unknown globals on non-primary registries
+        if oid != s.cli_reg_id && !s.comp_globals.iter().any(|g| g.name == bind_name) {
+            info!("  blocking bind to unknown global name={} on registry oid={} (not in compositor)", bind_name, oid);
+            return Ok(());
+        }
+    }
+
+    // Registry bind — forward to handle_bind for processing
     if s.cli_reg_id > 0 && oid == s.cli_reg_id && msg.opcode() == 0 {
         return handle_bind(s, msg);
     }
