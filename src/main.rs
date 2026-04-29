@@ -128,6 +128,8 @@ fn install_systemd_user_service(socket: &str, compositor: &str, config_path: Opt
     // This avoids "Text file busy" when source == target (i.e. the binary
     // is running FROM ~/.local/bin and we're overwriting itself).
     let binary_data = std::fs::read(&self_path)?;
+    // Delete before writing to avoid Text file busy
+    let _ = std::fs::remove_file(&target_bin);
     std::fs::write(&target_bin, &binary_data)?;
     // Make sure it's executable
     use std::os::unix::fs::PermissionsExt;
