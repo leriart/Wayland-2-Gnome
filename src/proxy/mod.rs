@@ -1012,6 +1012,9 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         
         // NOTE: xdg_wm_base tracking is handled by handle_bind for primary registries.
         
+        // Don't block binds on the primary registry (oid == cli_reg_id)
+        // as those go through handle_bind for proper processing.
+        
         // Block unknown globals on non-primary registries
         if oid != s.cli_reg_id && !s.comp_globals.iter().any(|g| g.name == bind_name) {
             info!("  blocking bind to unknown global name={} on registry oid={} (not in compositor)", bind_name, oid);
@@ -1032,62 +1035,8 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         return handle_fake_msg(s, &fake, msg);
     }
 
-    // Dynamic detection: if the compositor doesn't have layer_shell (we injected it),
-    // a message with op=0 and largish payload could be get_layer_surface on a
-    // proxy that got bound with a different new_id than the wire bind.
-    // Try to detect it dynamically.
-    // sniff_done is when globals_collected is true
-    let sniff_done = s.globals_collected;
-    if sniff_done && s.fake_global_name.is_some() && oid != 1 && oid != s.cli_reg_id && msg.opcode() == 0 && msg.raw.len() >= 32 && msg.raw.len() <= 48 {
-        // This could be get_layer_surface (op=0 in layer_shell)
-        // Wire layout after 8-byte header:
-        //   new_id(u32) at offset 8
-        //   surface(u32) at offset 12
-        //   output_or_zero(u32) at offset 16
-        //   layer(u32) at offset 20
-        //   ns_slen(u32) at offset 24
-        //   ns_data(slen bytes) at offset 28
-        //   padding to align 4
-        // get_layer_surface has a string namespace like "layer-test" or "overlay" etc.
-        let slen = if msg.raw.len() >= 28 {
-            Some(u32::from_ne_bytes([msg.raw[24], msg.raw[25], msg.raw[26], msg.raw[27]]))
-        } else {
-            None
-        };
-        if let Some(slen) = slen {
-            if slen <= 64 && slen >= 4 {
-                let ns_start = 28;
-                let ns_end = ns_start + slen as usize;
-                if ns_end <= msg.raw.len() {
-                    let ns = &msg.raw[ns_start..ns_end];
-                    // filter out null terminator for comparison
-                    let ns_trimmed = if ns.last() == Some(&0) { &ns[..ns.len()-1] } else { ns };
-                    if !ns_trimmed.is_ascii() || ns_trimmed.iter().any(|&b| b < 32) {
-                        // Not a valid string — not get_layer_surface
-                        send_raw(&s.to_comp, msg)?;
-                        return Ok(());
-                    }
-                    info!("dynamic intercept: cli_oid={} seems to be layer_shell, ns='{}'", oid, String::from_utf8_lossy(ns_trimmed));
-                    // First, remove the original fake object for new_id=20 (if any),
-                    // and replace with the correct OID
-                    if let Some(pos) = s.fake_objects.iter().position(|f| f.cli_oid == 20) {
-                        s.fake_objects[pos].cli_oid = oid;
-                    } else {
-                        s.fake_objects.push(FakeObject {
-                            cli_oid: oid, // the real OID the client uses
-                            iface: "zwlr_layer_shell_v1".to_string(),
-                            data: String::new(),
-                            next_sub_oid: 1,
-                        });
-                    }
-                    // Now dispatch to fake handler
-                    let fake_idx = s.fake_objects.iter().position(|f| f.cli_oid == oid).unwrap();
-                    let fake = s.fake_objects[fake_idx].clone();
-                    return handle_fake_msg(s, &fake, msg);
-                }
-            }
-        }
-    }
+    // Dynamic detection for get_layer_surface was removed.
+    // Now handled by early injection + bind pre-check interception.
 
 
     // Everything else: forward raw
@@ -1184,6 +1133,15 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     if iface == "xdg_wm_base" {
         s.cli_xdg_wm_base_id = new_id;
         info!("  identified xdg_wm_base at cli_oid={new_id}");
+        // Mutter has a bug where it rejects xdg_wm_base v7 binds on
+        // secondary registries. Always clamp to v6 (which works).
+        if cli_version > 6 {
+            info!("  clamping xdg_wm_base v{} to v6 (Mutter secondary registry workaround)", cli_version);
+            let mut clamped = msg.raw.clone();
+            let raw_ver_offset = 8 + 8 + str_padded;
+            clamped[raw_ver_offset..raw_ver_offset+4].copy_from_slice(&6u32.to_ne_bytes());
+            return send_raw_raw(&s.to_comp, clamped, &msg.fds);
+        }
     }
 
     // ⚠ Safety check: if the client is binding a global that doesn't exist
