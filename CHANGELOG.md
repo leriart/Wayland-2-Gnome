@@ -5,6 +5,23 @@ All notable changes to Wayland 2 GNOME are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-04-28
+
+### Fixed
+- **Clamp bind version to compositor's maximum** when the client requests a
+  higher version than what the compositor advertises. SCT/wayland-client
+  requests `zxdg_output_manager_v1` at version 4, but Mutter/GNOME only
+  supports v3. The compositor rejected the bind with `"invalid arguments for
+  wl_registry#2.bind"` and killed the connection.
+- **Prevent forwarding binds to unknown globals** — safety check in
+  `handle_bind()` that intercepts any bind request targeting a global not
+  present in the compositor's actual global list (excluding our injected
+  fake globals), preventing the "invalid arguments" protocol error.
+- **Deduplicate FakeObject tracking** when SCT internally binds multiple times
+  to the same injected global name=1000.
+- **Read binary into memory before `--install` overwrite** — avoids "Text file
+  busy (os error 26)" when the binary is running from the target path.
+
 ## [0.1.3] - 2026-04-28
 
 ### Fixed

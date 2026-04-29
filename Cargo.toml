@@ -1,6 +1,6 @@
 [package]
 name = "wayland-2-gnome"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 license = "MIT"
 description = "Protocol-aware Wayland proxy translating wlr-layer-shell to GNOME Shell overlays. Selective byte-level sniff-and-forward with per-client connections."

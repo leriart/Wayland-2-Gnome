@@ -52,6 +52,69 @@ pub fn make_raw(oid: u32, op: u16, pay: &[u8]) -> Vec<u8> {
 }
 
 /// Send one complete Wayland wire message (data + optional FDs) via sendmsg.
+/// Send raw buffer + fds (owned) without requiring a RawMsg reference.
+fn send_raw_raw(stream: &UnixStream, raw: Vec<u8>, fds: &[OwnedFd]) -> Result<()> {
+    let fd = stream.as_raw_fd();
+    let iov = [libc::iovec {
+        iov_base: raw.as_ptr() as *mut _,
+        iov_len: raw.len(),
+    }];
+
+    if fds.is_empty() {
+        let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
+        mhdr.msg_iov = iov.as_ptr() as *mut _;
+        mhdr.msg_iovlen = 1;
+        unsafe {
+            let n = libc::sendmsg(fd, &mhdr, libc::MSG_NOSIGNAL);
+            if n < 0 {
+                bail!("sendmsg: {}", std::io::Error::last_os_error());
+            }
+            if n as usize != raw.len() {
+                bail!("sendmsg: short write ({n})");
+            }
+        }
+        return Ok(());
+    }
+
+    let fds_raw: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
+    let clen =
+        unsafe { libc::CMSG_SPACE((fds_raw.len() * std::mem::size_of::<RawFd>()) as _) as usize };
+    let mut cbuf = vec![0u8; clen];
+    let mut mhdr: libc::msghdr = unsafe { std::mem::zeroed() };
+    mhdr.msg_iov = iov.as_ptr() as *mut _;
+    mhdr.msg_iovlen = 1;
+    mhdr.msg_control = cbuf.as_mut_ptr() as *mut _;
+    mhdr.msg_controllen = clen;
+
+    unsafe {
+        let c = libc::CMSG_FIRSTHDR(&mhdr);
+        if c.is_null() {
+            bail!("CMSG_FIRSTHDR null");
+        }
+        let c = &mut *c;
+        c.cmsg_level = libc::SOL_SOCKET;
+        c.cmsg_type = libc::SCM_RIGHTS;
+        c.cmsg_len =
+            libc::CMSG_LEN((fds_raw.len() * std::mem::size_of::<RawFd>()) as _) as _;
+        std::ptr::copy_nonoverlapping(
+            fds_raw.as_ptr(),
+            libc::CMSG_DATA(c) as *mut RawFd,
+            fds_raw.len(),
+        );
+    }
+
+    unsafe {
+        let n = libc::sendmsg(fd, &mhdr, libc::MSG_NOSIGNAL);
+        if n < 0 {
+            bail!("sendmsg: {}", std::io::Error::last_os_error());
+        }
+        if n as usize != raw.len() {
+            bail!("sendmsg: short write ({n})");
+        }
+    }
+    Ok(())
+}
+
 fn send_raw(stream: &UnixStream, msg: &RawMsg) -> Result<()> {
     let fd = stream.as_raw_fd();
     let iov = [libc::iovec {
@@ -1037,7 +1100,9 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
 
     let global = s.comp_globals.iter().find(|g| g.name == global_name);
     let iface = global.map(|g| g.interface.as_str()).unwrap_or("?");
-    info!("bind: name={global_name}, new_id={new_id}, iface={iface}");
+    let comp_version = global.map(|g| g.version).unwrap_or(1);
+    let cli_version = u32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]);
+    info!("bind: name={global_name}, new_id={new_id}, iface={iface}, cli_v={cli_version}, comp_v={comp_version}");
 
     if iface == "xdg_wm_base" {
         s.cli_xdg_wm_base_id = new_id;
@@ -1051,6 +1116,18 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     if global_name != FAKE_GLOBAL_LAYER_SHELL && !is_real_global {
         warn!("  ⚠ intercepted bind to unknown global name={}, iface='{}' — preventing compositor error", global_name, iface);
         return Ok(());
+    }
+
+    // Clamp version: if the client requests a version higher than what the
+    // compositor supports, Mutter rejects the bind with "invalid arguments".
+    // We must cap cli_version to comp_version before forwarding.
+    if cli_version > comp_version {
+        info!("  clamping bind version {} -> {} for {} (compositor only supports up to v{})",
+            cli_version, comp_version, iface, comp_version);
+        let mut clamped = msg.raw.clone();
+        let ver_offset = 8 + 8; // skip OID/op/size(8) + name+new_id(8)
+        clamped[ver_offset..ver_offset+4].copy_from_slice(&comp_version.to_ne_bytes());
+        return send_raw_raw(&s.to_comp, clamped, &msg.fds);
     }
 
     // Forward to compositor
