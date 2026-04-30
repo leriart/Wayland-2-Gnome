@@ -1018,16 +1018,21 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             let mut raw = msg.raw.clone();
             raw[8..12].copy_from_slice(&comp_oid.to_ne_bytes());
             send_raw_raw(&s.to_comp, raw, &msg.fds)?;
-            // Inject zwlr_layer_shell_v1 + key compositor globals on client registry
+            // Inject zwlr_layer_shell_v1 + wl_compositor + xdg_wm_base on client registry
             let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-            // Replay wl_compositor and xdg_wm_base from cached globals (GTK needs them)
-            for g in &s.comp_globals {
-                if g.interface == "wl_compositor" || g.interface == "xdg_wm_base" {
-                    let evt = make_global_event(new_id, g.name, &g.interface, g.version);
-                    let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-                }
-            }
+            // wl_compositor and xdg_wm_base: use cached values if available, else Mutter defaults
+            let wl_comp = s.comp_globals.iter().find(|g| g.interface == "wl_compositor");
+            let comp_name = wl_comp.map(|g| g.name).unwrap_or(1);
+            let comp_ver = wl_comp.map(|g| g.version).unwrap_or(6);
+            let evt = make_global_event(new_id, comp_name, "wl_compositor", comp_ver);
+            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
+            let xdg = s.comp_globals.iter().find(|g| g.interface == "xdg_wm_base");
+            let xdg_name = xdg.map(|g| g.name).unwrap_or(10);
+            let xdg_ver = xdg.map(|g| g.version).unwrap_or(7);
+            let evt = make_global_event(new_id, xdg_name, "xdg_wm_base", xdg_ver);
+            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
+            info!("  injected: layer_shell + wl_compositor(name={comp_name}) + xdg_wm_base(name={xdg_name})");
         }
         return Ok(());
     }
