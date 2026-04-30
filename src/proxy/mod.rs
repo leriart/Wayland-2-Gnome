@@ -293,10 +293,10 @@ fn read_raw(stream: &UnixStream) -> Result<RawMsg> {
 /// The interface string for wlr-layer-shell.
 const LAYER_SHELL_IFACE: &str = "zwlr_layer_shell_v1";
 /// Max version we'll advertise for the injected layer shell.
-const LAYER_SHELL_VERSION: u32 = 5;
+const LAYER_SHELL_VERSION: u32 = 4;
 /// Fake global name we inject when the compositor doesn't have layer shell.
 /// Using a high value to avoid colliding with real compositor globals.
-const FAKE_GLOBAL_LAYER_SHELL: u32 = 1000;
+const FAKE_GLOBAL_LAYER_SHELL: u32 = 43;
 /// Starting OID for bridge-managed objects.
 /// Set to a reasonably high value to avoid colliding with client's dynamic OIDs
 /// but not so high that Mutter rejects it (Mutter caps OIDs internally).
@@ -645,6 +645,10 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         .unwrap_or_else(|_| "/run/user/1000".to_string());
     let comp_display = std::env::var("WAYLAND_DISPLAY")
         .unwrap_or_else(|_| "wayland-0".to_string());
+    // Inject the fake layer_shell global IMMEDIATELY, before any registry is created.
+    // This ensures the global is in the client's socket buffer before
+    // registry_queue_init starts its round-trip dispatch.
+
     let comp_path = format!("{rdir}/{comp_display}");
     let mut s = Session {
         to_cli,
@@ -891,11 +895,6 @@ fn sniff_global(s: &mut Session, msg: &RawMsg) {
 /// After globals are collected, inject a fake `zwlr_layer_shell_v1` global
 /// if the compositor didn't advertise one.
 fn maybe_inject_layer_shell(s: &mut Session) -> Result<()> {
-    // If we already injected during get_registry, don't inject again.
-    if s.injected_layer_shell {
-        info!("layer_shell already injected early — skipping second injection");
-        return Ok(());
-    }
     let has_layer_shell = s.comp_globals.iter().any(|g| g.interface == "zwlr_layer_shell_v1");
     if has_layer_shell {
         info!("compositor has zwlr_layer_shell_v1 — no injection needed");
@@ -981,25 +980,21 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         
         if is_first {
             s.cli_reg_id = new_id;
-            s.comp_reg_id = new_id;
             // Inject fake layer_shell global BEFORE compositor globals arrive
             info!("Injecting fake layer_shell global (name={}) on registry id={}",
                 FAKE_GLOBAL_LAYER_SHELL, new_id);
-            let evt = make_global_event(
-                new_id,
-                FAKE_GLOBAL_LAYER_SHELL,
-                LAYER_SHELL_IFACE,
-                LAYER_SHELL_VERSION,
-            );
+            let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
             s.injected_layer_shell = true;
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
         } else {
-            // Secondary registry: forward to compositor normally.
-            // DON'T inject fake layer_shell here — GDK/Cairo just
-            // need xdg_wm_base and other standard globals.
-            info!("Forwarding get_registry for secondary registry id={}", new_id);
+            // Secondary registry: forward + inject layer_shell.
+            // gtk-layer-shell creates its OWN registry via GDK to bind layer_shell.
+            // We must inject on ALL registries so GDK finds it.
+            info!("Forwarding get_registry for secondary registry id={} + layer_shell injection", new_id);
+            let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
+            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
             send_raw(&s.to_comp, msg)?;
         }
         return Ok(());
