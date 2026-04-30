@@ -297,9 +297,10 @@ const LAYER_SHELL_VERSION: u32 = 5;
 /// Fake global name we inject when the compositor doesn't have layer shell.
 /// Using a high value to avoid colliding with real compositor globals.
 const FAKE_GLOBAL_LAYER_SHELL: u32 = 1000;
-/// Starting OID for bridge-managed objects (no conflict with client OIDs).
-/// Using a high value to avoid colliding with client's dynamic OIDs.
-const OID_BASE: u32 = 0x80000000;
+/// Starting OID for bridge-managed objects.
+/// Set to a reasonably high value to avoid colliding with client's dynamic OIDs
+/// but not so high that Mutter rejects it (Mutter caps OIDs internally).
+const OID_BASE: u32 = 10000;
 
 // ─── State ──────────────────────────────────────────────────────────────────
 
@@ -716,7 +717,7 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
               _fd: &mut calloop::generic::NoIoDrop<UnixStream>,
               session: &mut Session| {
             // Read one message from compositor
-            let mut raw_msg = match read_raw(&session.to_comp) {
+            let msg = match read_raw(&session.to_comp) {
                 Ok(m) => m,
                 Err(e) => {
                     info!("Compositor EOF: {e}");
@@ -728,12 +729,6 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
                     ));
                 }
             };
-            
-            // Reverse-remap the compositor OID to client OID before any logic
-            if let Some(&cli_oid) = session.oid_remap.to_cli.get(&raw_msg.object_id()) {
-                raw_msg.raw[0..4].copy_from_slice(&cli_oid.to_ne_bytes());
-            }
-            let msg = raw_msg;
 
             // Collect phase: globals not yet accumulated
             if !session.globals_collected && session.comp_reg_id > 0 {
@@ -1012,8 +1007,8 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.cli_reg_id = new_id;
             s.comp_reg_id = new_id;
             // Inject fake layer_shell global BEFORE compositor globals arrive
-            info!("Injecting fake layer_shell global (name={}) on registry id={}, forwarding get_registry as-is (comp_id={})",
-                FAKE_GLOBAL_LAYER_SHELL, new_id, new_id);
+            info!("Injecting fake layer_shell global (name={}) on registry id={}",
+                FAKE_GLOBAL_LAYER_SHELL, new_id);
             let evt = make_global_event(
                 new_id,
                 FAKE_GLOBAL_LAYER_SHELL,
@@ -1025,15 +1020,9 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
         } else {
-            // Secondary registry: REMAP the new_id to avoid OID collisions on the shared compositor connection.
-            // The client uses new_id for the registry object on its side. The compositor has objects
-            // at other OIDs (from the primary registry's binds). We allocate a fresh OID for the compositor.
-            let comp_reg_id = s.next_oid;
-            s.next_oid += 1;
-            info!("Injecting fake layer_shell global (name={}) on secondary registry id={} (comp remapped to {})",
-                FAKE_GLOBAL_LAYER_SHELL, new_id, comp_reg_id);
-            
-            // Inject fake layer_shell on client-side OID
+            // Secondary registry: inject fake layer_shell on client-side OID
+            info!("Injecting fake layer_shell global (name={}) on secondary registry id={}",
+                FAKE_GLOBAL_LAYER_SHELL, new_id);
             let evt = make_global_event(
                 new_id,
                 FAKE_GLOBAL_LAYER_SHELL,
@@ -1041,14 +1030,9 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                 LAYER_SHELL_VERSION,
             );
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-            
-            // Rewrite get_registry to use remapped compositor OID
-            let mut remapped = msg.raw.clone();
-            remapped[8..12].copy_from_slice(&comp_reg_id.to_ne_bytes());
-            send_raw_raw(&s.to_comp, remapped, &msg.fds)?;
-            
-            // Track the mapping
-            s.oid_remap.insert(new_id, comp_reg_id, "wl_registry".to_string());
+            // Forward the get_registry as-is — the client's OIDs are already unique within
+            // this connection (the client library manages this). Only BINDS cause collisions.
+            send_raw(&s.to_comp, msg)?;
         }
         return Ok(());
     }
