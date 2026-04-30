@@ -1061,6 +1061,7 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             // Forward a dummy wl_compositor bind to fill the OID gap on Mutter.
             let fill = make_raw(oid, 0, &make_bind_payload(1, "wl_compositor", 1, bind_new_id));
             let _ = send_raw_raw(&s.to_comp, fill, &[]);
+            if bind_new_id > s.mutter_max_oid { s.mutter_max_oid = bind_new_id; }
             return Ok(());
         }
         
@@ -1212,6 +1213,7 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
         // Forward a dummy wl_compositor bind to fill the OID gap on Mutter
         let fill = make_raw(msg.object_id(), 0, &make_bind_payload(1, "wl_compositor", 1, new_id));
         let _ = send_raw_raw(&s.to_comp, fill, &[]);
+        if new_id > s.mutter_max_oid { s.mutter_max_oid = new_id; }
         return Ok(());
     }
 
