@@ -1102,12 +1102,22 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                     return Ok(());
                 }
                 
-                // All other globals: forward as-is to compositor.
-                let known = s.comp_globals.iter().any(|g| g.name == bind_name);
-                if known {
-                    info!("  forwarding bind on secondary registry oid={}: name={}, iface='{}', new_id={}",
-                        oid, bind_name, iface_str, bind_new_id);
-                    return send_raw(&s.to_comp, msg);
+                // All other globals: forward to compositor with version clamping.
+                let known_global = s.comp_globals.iter().find(|g| g.name == bind_name);
+                if let Some(global) = known_global {
+                    let comp_version = global.version;
+                    let mut raw = msg.raw.clone();
+                    if bind_version > comp_version {
+                        if let Some(ver_off) = find_version_offset_in_bind(&msg.raw[8..]) {
+                            raw[8+ver_off..8+ver_off+4].copy_from_slice(&comp_version.to_ne_bytes());
+                        }
+                        info!("  forwarding bind on secondary registry oid={}: name={}, iface='{}', new_id={}, clamped v{}->v{}",
+                            oid, bind_name, iface_str, bind_new_id, bind_version, comp_version);
+                    } else {
+                        info!("  forwarding bind on secondary registry oid={}: name={}, iface='{}', new_id={}, v{}",
+                            oid, bind_name, iface_str, bind_new_id, bind_version);
+                    }
+                    return send_raw_raw(&s.to_comp, raw, &msg.fds);
                 } else {
                     info!("  blocking bind to unknown global name={} on secondary registry oid={}", bind_name, oid);
                     return Ok(());
