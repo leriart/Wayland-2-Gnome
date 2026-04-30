@@ -1074,12 +1074,28 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                     let comp_oid = s.next_oid;
                     s.next_oid += 1;
                     
-                    info!("  remapping bind on registry oid={}: global name={}, iface='{}', cli_new_id={} -> comp_oid={}",
-                        oid, bind_name, iface_str, bind_new_id, comp_oid);
+                    // Version clamping: client may request higher version than compositor supports
+                    let comp_version = global.version;
+                    let cli_version = bind_version;
+                    
+                    info!("  remapping bind on registry oid={}: global name={}, iface='{}', cli_new_id={} -> comp_oid={}, cli_v={}, comp_v={}",
+                        oid, bind_name, iface_str, bind_new_id, comp_oid, cli_version, comp_version);
                     
                     // Create the remapped bind message
                     let mut remapped_raw = msg.raw.clone();
-                    // new_id is at a variable offset. Use the helper to find it.
+                    
+                    // Clamp version to compositor's max if needed
+                    if cli_version > comp_version {
+                        if let Some(ver_offset_in_pay) = find_version_offset_in_bind(&msg.raw[8..]) {
+                            let raw_ver_offset = 8 + ver_offset_in_pay;
+                            if raw_ver_offset + 4 <= remapped_raw.len() {
+                                remapped_raw[raw_ver_offset..raw_ver_offset+4].copy_from_slice(&comp_version.to_ne_bytes());
+                                info!("  clamped bind version {} -> {} for {}", cli_version, comp_version, iface_str);
+                            }
+                        }
+                    }
+                    
+                    // Rewrite new_id
                     if let Some(offset) = find_new_id_offset_in_bind(&msg.raw[8..]) {
                         let pay_offset = 8 + offset;
                         if pay_offset + 4 <= remapped_raw.len() {
@@ -1158,6 +1174,15 @@ fn find_new_id_offset_in_bind(pay: &[u8]) -> Option<usize> {
     let str_padded = (slen + 3) & !3;
     let new_id_offset = 8 + str_padded + 4;
     if new_id_offset + 4 <= pay.len() { Some(new_id_offset) } else { None }
+}
+
+/// Find the offset of version within a bind payload (relative to start of payload).
+fn find_version_offset_in_bind(pay: &[u8]) -> Option<usize> {
+    if pay.len() < 12 { return None; }
+    let slen = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]) as usize;
+    let str_padded = (slen + 3) & !3;
+    let ver_offset = 8 + str_padded;
+    if ver_offset + 4 <= pay.len() { Some(ver_offset) } else { None }
 }
 
 /// Rewrite a message targeting a remapped OID.
