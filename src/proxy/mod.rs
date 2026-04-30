@@ -1034,28 +1034,11 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         
         // zxdg_output_manager_v1: forward to compositor
 
-        // NON-PRIMARY REGISTRIES: forward binds to compositor with version clamping.
-        // (The primary registry goes through handle_bind below, which does the same.)
+        // NON-PRIMARY REGISTRIES: always forward to Mutter.
+        // The compositor knows its globals better than our comp_globals cache.
         if oid != s.cli_reg_id {
-            if let Some(iface_str) = &bind_iface_str {
-                let known_global = s.comp_globals.iter().find(|g| g.name == bind_name);
-                if let Some(global) = known_global {
-                    let comp_version = global.version;
-                    let mut raw = msg.raw.clone();
-                    if bind_version > comp_version {
-                        if let Some(ver_off) = find_version_offset_in_bind(&msg.raw[8..]) {
-                            raw[8+ver_off..8+ver_off+4].copy_from_slice(&comp_version.to_ne_bytes());
-                        }
-                    }
-                    info!("  bind on registry oid={}: name={}, iface='{}', new_id={}, cli_v={}, comp_v={}",
-                        oid, bind_name, iface_str, bind_new_id, bind_version, comp_version);
-                    return send_raw_raw(&s.to_comp, raw, &msg.fds);
-                } else {
-                    info!("  blocking bind to unknown global name={} on registry oid={}", bind_name, oid);
-                    return Ok(());
-                }
-            }
-            return Ok(());
+            info!("  bind on registry oid={}: name={}, new_id={}, v={}", oid, bind_name, bind_new_id, bind_version);
+            return send_raw(&s.to_comp, msg);
         }
     }
 
