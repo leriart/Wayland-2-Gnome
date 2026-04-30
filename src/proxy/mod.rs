@@ -1072,9 +1072,11 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         // For all other globals, forward as-is.
         if oid != s.cli_reg_id {
             if let Some(iface_str) = &bind_iface_str {
-                // Intercept xdg_wm_base on non-primary registries (forward via primary).
+                // NON-PRIMARY REGISTRIES: intercept problematic globals that fail
+                // when forwarded. xdg_wm_base and zxdg_output_manager_v1 both fail
+                // because their sub-requests reference OIDs from the primary's namespace.
                 if iface_str == "xdg_wm_base" && bind_new_id > 0 {
-                    info!("  intercepting xdg_wm_base on secondary registry oid={}: new_id={}, forwarding via primary oid={}",
+                    info!("  intercepting xdg_wm_base on secondary registry oid={}: new_id={}, via primary oid={}",
                         oid, bind_new_id, s.cli_xdg_wm_base_id);
                     if !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
                         s.fake_objects.push(FakeObject {
@@ -1086,10 +1088,6 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                     }
                     return Ok(());
                 }
-                
-                // Intercept zxdg_output_manager_v1 on secondary registries.
-                // The compositor won't accept its get_xdg_output calls from these
-                // registries because the wl_output OID namespace is shared.
                 if iface_str == "zxdg_output_manager_v1" && bind_new_id > 0 {
                     info!("  intercepting zxdg_output_manager_v1 on secondary registry oid={}: new_id={}",
                         oid, bind_new_id);
@@ -1104,7 +1102,7 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                     return Ok(());
                 }
                 
-                // All other globals: forward as-is
+                // All other globals: forward as-is to compositor.
                 let known = s.comp_globals.iter().any(|g| g.name == bind_name);
                 if known {
                     info!("  forwarding bind on secondary registry oid={}: name={}, iface='{}', new_id={}",
