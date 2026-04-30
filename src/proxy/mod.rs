@@ -53,6 +53,25 @@ pub fn make_raw(oid: u32, op: u16, pay: &[u8]) -> Vec<u8> {
 }
 
 /// Build a wl_registry.bind payload (name, interface string, version, new_id).
+/// Get a contiguous OID on Mutter for the given client OID.
+/// Fills any gaps with dummy wl_compositor binds.
+fn ensure_contiguous(s: &mut Session, client_oid: u32) -> u32 {
+    if client_oid <= s.mutter_max_oid + 1 {
+        // Already contiguous or reused
+        if client_oid > s.mutter_max_oid { s.mutter_max_oid = client_oid; }
+        return client_oid;
+    }
+    // Gap detected: fill with dummy binds, return the client's OID
+    let reg = s.cli_reg_id;
+    for fill in (s.mutter_max_oid + 1)..client_oid {
+        info!("  filling OID gap: {} (dummy wl_compositor)", fill);
+        let m = make_raw(reg, 0, &make_bind_payload(1, "wl_compositor", 1, fill));
+        let _ = send_raw_raw(&s.to_comp, m, &[]);
+    }
+    s.mutter_max_oid = client_oid;
+    client_oid
+}
+
 fn make_bind_payload(name: u32, iface: &str, version: u32, new_id: u32) -> Vec<u8> {
     let mut iface_b = iface.as_bytes().to_vec();
     iface_b.push(0);
@@ -382,6 +401,10 @@ struct Session {
     all_registry_ids: Vec<u32>,
     /// Highest OID forwarded to Mutter (for gap detection before syncs)
     mutter_max_oid: u32,
+    /// OID remapping for secondary registries: client->compositor
+    oid_map: HashMap<u32, u32>,
+    /// Reverse: compositor->client
+    oid_rev: HashMap<u32, u32>,
 }
 
 #[derive(Clone)]
@@ -690,6 +713,8 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         monitors: Vec::new(),
         all_registry_ids: Vec::new(),
         mutter_max_oid: 2,
+        oid_map: HashMap::new(),
+        oid_rev: HashMap::new(),
 
     };
 
@@ -1006,6 +1031,7 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
             s.injected_layer_shell = true;
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
+            ensure_contiguous(s, new_id);
             send_raw(&s.to_comp, msg)?;
         } else {
             // Secondary registry: forward + inject layer_shell.
@@ -1055,6 +1081,7 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                     }
                     info!("  bind on registry oid={}: name={}, iface='{}', new_id={}, cli_v={}, comp_v={}",
                         oid, bind_name, iface_str, bind_new_id, bind_version, comp_version);
+                    ensure_contiguous(s, bind_new_id);
                     return send_raw_raw(&s.to_comp, raw, &msg.fds);
                 } else {
                     info!("  blocking bind to unknown global name={} on registry oid={}", bind_name, oid);
@@ -1078,19 +1105,11 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         return handle_fake_msg(s, &fake, msg);
     }
 
-    // wl_display.sync: forward to Mutter, filling any OID gaps first.
+    // wl_display.sync: forward to Mutter, ensuring contiguous OID.
     if oid == 1 && op == 0 && msg.raw.len() >= 12 {
         let cb_new_id = u32::from_ne_bytes([msg.raw[8], msg.raw[9], msg.raw[10], msg.raw[11]]);
         info!("  wl_display.sync(callback={})", cb_new_id);
-        // Fill OID gap if this sync callback OID skipped some values
-        if cb_new_id > s.mutter_max_oid + 1 {
-            for fill in (s.mutter_max_oid + 1)..cb_new_id {
-                info!("  filling OID gap before sync: {} (dummy wl_compositor)", fill);
-                let f = make_raw(s.cli_reg_id, 0, &make_bind_payload(1, "wl_compositor", 1, fill));
-                let _ = send_raw_raw(&s.to_comp, f, &[]);
-            }
-        }
-        if cb_new_id > s.mutter_max_oid { s.mutter_max_oid = cb_new_id; }
+        ensure_contiguous(s, cb_new_id);
         return send_raw(&s.to_comp, msg);
     }
 
@@ -1249,11 +1268,12 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
         let mut clamped = msg.raw.clone();
         let raw_ver_offset = 8 + 8 + str_padded; // msg.raw[8+8+str_padded]
         clamped[raw_ver_offset..raw_ver_offset+4].copy_from_slice(&comp_version.to_ne_bytes());
+        ensure_contiguous(s, new_id);
         return send_raw_raw(&s.to_comp, clamped, &msg.fds);
     }
 
     // Track OID and forward to compositor
-    if new_id > s.mutter_max_oid { s.mutter_max_oid = new_id; }
+    ensure_contiguous(s, new_id);
     send_raw(&s.to_comp, msg)
 }
 
