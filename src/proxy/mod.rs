@@ -1068,22 +1068,35 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         // We don't need special handling — the remapped xdg_wm_base will work as a
         // normal compositor object on the shared connection.
         
-        // NON-PRIMARY REGISTRIES: intercept ALL binds silently.
-        // Secondary registries (from GDK/Cairo) bind globals just to confirm they exist.
-        // They don't actually use the objects for layer_shell operations.
-        // Forwarding these binds to the shared compositor connection causes OID collisions.
+        // NON-PRIMARY REGISTRIES: intercept xdg_wm_base and forward via primary.
+        // For all other globals, forward as-is.
         if oid != s.cli_reg_id {
             if let Some(iface_str) = &bind_iface_str {
-                info!("  intercepting bind on secondary registry oid={}: global name={}, iface='{}', new_id={}",
-                    oid, bind_name, iface_str, bind_new_id);
-                // Create a transparent fake object to absorb any messages.
-                if bind_new_id > 0 && !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
-                    s.fake_objects.push(FakeObject {
-                        cli_oid: bind_new_id,
-                        iface: format!("transparent:{}", iface_str),
-                        next_sub_oid: bind_new_id + 1,
-                        data: String::new(),
-                    });
+                // Intercept xdg_wm_base on non-primary registries.
+                // Store the client OID and forward requests to the primary's xdg_wm_base.
+                if iface_str == "xdg_wm_base" && bind_new_id > 0 {
+                    info!("  intercepting xdg_wm_base on secondary registry oid={}: new_id={}, forwarding via primary xdg_wm_base oid={}",
+                        oid, bind_new_id, s.cli_xdg_wm_base_id);
+                    if !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
+                        s.fake_objects.push(FakeObject {
+                            cli_oid: bind_new_id,
+                            iface: "xdg_wm_base".into(),
+                            next_sub_oid: bind_new_id + 1,
+                            data: s.cli_xdg_wm_base_id.to_string(),
+                        });
+                    }
+                    return Ok(());
+                }
+                
+                // All other globals: forward as-is
+                let known = s.comp_globals.iter().any(|g| g.name == bind_name);
+                if known {
+                    info!("  forwarding bind on secondary registry oid={}: name={}, iface='{}', new_id={}",
+                        oid, bind_name, iface_str, bind_new_id);
+                    return send_raw(&s.to_comp, msg);
+                } else {
+                    info!("  blocking bind to unknown global name={} on secondary registry oid={}", bind_name, oid);
+                    return Ok(());
                 }
             }
             return Ok(());
@@ -1112,6 +1125,12 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         // Rewrite header OID and handle payload new_ids
         let remapped = rewrite_message_for_remap(s, comp_oid, msg);
         return send_raw_raw(&s.to_comp, remapped, &msg.fds);
+    }
+
+    // Debug: log wl_display.sync messages
+    if oid == 1 && op == 0 && msg.raw.len() >= 12 {
+        let cb_new_id = u32::from_ne_bytes([msg.raw[8], msg.raw[9], msg.raw[10], msg.raw[11]]);
+        info!("  wl_display.sync(callback={})", cb_new_id);
     }
 
     // Everything else: forward raw
@@ -1931,6 +1950,11 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
         let err_code = if pay.len() >= 8 { u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]) } else { 0 };
         let err_msg = if pay.len() > 8 { String::from_utf8_lossy(&pay[8..]).trim_end_matches('\0').to_string() } else { String::new() };
         error!("COMPOSITOR PROTOCOL ERROR: object={}, code={}, msg='{}'", err_oid, err_code, err_msg);
+        debug!("  error raw ({} bytes): {:02x?}", msg.raw.len(), &msg.raw);
+        // Also log the string bytes to check for truncation
+        if pay.len() > 8 {
+            debug!("  error string bytes: {:02x?} (pay offset 8+, {} bytes available)", &pay[8..], pay.len() - 8);
+        }
         return send_raw(&s.to_cli, msg);
     }
 
