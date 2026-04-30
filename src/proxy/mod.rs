@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -364,8 +363,6 @@ struct Session {
     translation_map: Vec<TranslationEntry>,
     /// All registry object IDs (client-side) created by this client.
     all_registry_ids: Vec<u32>,
-    /// OID remapping for secondary registries: compositor OID -> client OID
-    oid_rev: HashMap<u32, u32>,
 }
 
 #[derive(Clone)]
@@ -673,7 +670,6 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         output_events_delivered: false,
         monitors: Vec::new(),
         all_registry_ids: Vec::new(),
-        oid_rev: HashMap::new(),
 
     };
 
@@ -1009,30 +1005,14 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
         } else {
-            // Secondary registry: forward to Mutter with OID remapping.
-            let comp_oid = s.next_oid;
-            s.next_oid += 1;
-            s.oid_rev.insert(comp_oid, new_id);
-            info!("OID remap: secondary registry cli={} -> comp={}", new_id, comp_oid);
-            // Forward get_registry with remapped OID
-            let mut raw = msg.raw.clone();
-            raw[8..12].copy_from_slice(&comp_oid.to_ne_bytes());
-            send_raw_raw(&s.to_comp, raw, &msg.fds)?;
-            // Inject zwlr_layer_shell_v1 + wl_compositor + xdg_wm_base on client registry
+            // Secondary registry: inject globals directly (not forwarded to Mutter).
+            info!("Secondary registry cli={}: injecting globals", new_id);
             let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-            // wl_compositor and xdg_wm_base: use cached values if available, else Mutter defaults
-            let wl_comp = s.comp_globals.iter().find(|g| g.interface == "wl_compositor");
-            let comp_name = wl_comp.map(|g| g.name).unwrap_or(1);
-            let comp_ver = wl_comp.map(|g| g.version).unwrap_or(6);
-            let evt = make_global_event(new_id, comp_name, "wl_compositor", comp_ver);
+            let evt = make_global_event(new_id, 1, "wl_compositor", 6);
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-            let xdg = s.comp_globals.iter().find(|g| g.interface == "xdg_wm_base");
-            let xdg_name = xdg.map(|g| g.name).unwrap_or(10);
-            let xdg_ver = xdg.map(|g| g.version).unwrap_or(7);
-            let evt = make_global_event(new_id, xdg_name, "xdg_wm_base", xdg_ver);
+            let evt = make_global_event(new_id, 10, "xdg_wm_base", 7);
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-            info!("  injected: layer_shell + wl_compositor(name={comp_name}) + xdg_wm_base(name={xdg_name})");
         }
         return Ok(());
     }
@@ -1055,17 +1035,31 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         
         // zxdg_output_manager_v1: forward to compositor
 
-        // NON-PRIMARY REGISTRIES: remap registry OID, then forward.
+        // NON-PRIMARY REGISTRIES: secondary registries not forwarded to Mutter.
+        // Intercept specific binds and redirect to primary objects.
         if oid != s.cli_reg_id {
-            // Find the compositor-side registry OID
-            let comp_reg = s.oid_rev.iter()
-                .find(|(_, &v)| v == oid)
-                .map(|(&k, _)| k)
-                .unwrap_or(oid);
-            info!("  secondary bind: reg cli={}->comp={} name={} new_id={}", oid, comp_reg, bind_name, bind_new_id);
-            let mut raw = msg.raw.clone();
-            raw[0..4].copy_from_slice(&comp_reg.to_ne_bytes());
-            return send_raw_raw(&s.to_comp, raw, &msg.fds);
+            if bind_name == 1 {
+                // wl_compositor: redirect to primary compositor
+                if s.comp_compositor_name != 0 {
+                    let fake = FakeObject { cli_oid: bind_new_id, iface: "wl_compositor".into(),
+                        next_sub_oid: bind_new_id + 1,
+                        data: s.comp_compositor_id.to_string() };
+                    s.fake_objects.push(fake);
+                    info!("  secondary wl_compositor bind → redirect to oid={}", s.comp_compositor_id);
+                }
+            } else if bind_name == 10 {
+                // xdg_wm_base: redirect to primary
+                if s.cli_xdg_wm_base_id != 0 {
+                    let fake = FakeObject { cli_oid: bind_new_id, iface: "xdg_wm_base".into(),
+                        next_sub_oid: bind_new_id + 1,
+                        data: s.cli_xdg_wm_base_id.to_string() };
+                    s.fake_objects.push(fake);
+                    info!("  secondary xdg_wm_base bind → redirect to oid={}", s.cli_xdg_wm_base_id);
+                }
+            } else {
+                info!("  secondary bind ignored: name={} new_id={}", bind_name, bind_new_id);
+            }
+            return Ok(());
         }
     }
 
@@ -1822,13 +1816,6 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
 
 
     debug!("comp -> cli: oid={}, op={}, size={} raw={:02x?}", oid, msg.opcode(), msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
-
-    // Reverse-remap compositor OIDs for secondary registries
-    if let Some(&cli_oid) = s.oid_rev.get(&oid) {
-        let mut remapped = msg.raw.clone();
-        remapped[0..4].copy_from_slice(&cli_oid.to_ne_bytes());
-        return send_raw_raw(&s.to_cli, remapped, &msg.fds);
-    }
 
     if oid == 1 && msg.opcode() == 0 {
         let pay = &msg.raw[8..];
