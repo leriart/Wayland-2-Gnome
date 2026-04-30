@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -364,8 +363,6 @@ struct Session {
     translation_map: Vec<TranslationEntry>,
     /// All registry object IDs (client-side) created by this client.
     all_registry_ids: Vec<u32>,
-    /// Sync callback OID remapping to avoid collision with surfaces.
-    sync_remap: HashMap<u32, u32>,
 }
 
 #[derive(Clone)]
@@ -673,7 +670,6 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         output_events_delivered: false,
         monitors: Vec::new(),
         all_registry_ids: Vec::new(),
-        sync_remap: HashMap::new(),
 
     };
 
@@ -969,19 +965,6 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         }
     }
 
-    // wl_display.sync: remap callback OID to avoid collision with surfaces/registries
-    if oid == 1 && msg.opcode() == 0 && msg.raw.len() >= 12 {
-        let cli_cb = u32::from_ne_bytes([msg.raw[8], msg.raw[9], msg.raw[10], msg.raw[11]]);
-        let comp_cb = s.next_oid;
-        s.next_oid += 1;
-        info!("  remapping wl_display.sync callback={} -> {}", cli_cb, comp_cb);
-        let mut remapped = msg.raw.clone();
-        remapped[8..12].copy_from_slice(&comp_cb.to_ne_bytes());
-        // Store mapping for reverse remap
-        s.sync_remap.insert(comp_cb, cli_cb);
-        return send_raw_raw(&s.to_comp, remapped, &msg.fds);
-    }
-
     // wl_display.get_registry (oid=1, op=1) — forward, then enable sniffing
     if oid == 1 && msg.opcode() == 1 {
         let new_id = if msg.raw.len() >= 12 {
@@ -1004,6 +987,10 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.injected_layer_shell = true;
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
+            // Yield to let client process fake layer_shell global before sending binds.
+            // Without this, the client may send binds that reference globals it hasn't 
+            // processed yet, causing Mutter to reject them.
+            std::thread::sleep(std::time::Duration::from_millis(5));
         } else {
             // Secondary registry: forward + inject layer_shell.
             // gtk-layer-shell creates its OWN registry via GDK to bind layer_shell.
@@ -1012,6 +999,10 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
             send_raw(&s.to_comp, msg)?;
+            // Yield to let client process fake layer_shell global before sending binds.
+            // Without this, the client may send binds that reference globals it hasn't 
+            // processed yet, causing Mutter to reject them.
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         return Ok(());
     }
@@ -1032,16 +1023,8 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             return Ok(());
         }
         
-        // Intercept zxdg_output_manager ONLY if the compositor doesn't have it.
-        // GNOME has it, so we let it through (compositor provides real events).
-        if bind_name == 5 && !s.comp_globals.iter().any(|g| g.interface == "zxdg_output_manager_v1") {
-            if bind_new_id > 0 && !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
-                s.fake_objects.push(FakeObject { cli_oid: bind_new_id, iface: "zxdg_output_manager_v1".into(), next_sub_oid: bind_new_id + 1, data: String::new() });
-                info!("  intercepted zxdg_output_manager_v1 at cli_oid={}", bind_new_id);
-            }
-            return Ok(());
-        }
-        
+        // zxdg_output_manager_v1: forward to compositor (Mutter provides it)
+
         // NON-PRIMARY REGISTRIES: forward binds to compositor with version clamping.
         // (The primary registry goes through handle_bind below, which does the same.)
         if oid != s.cli_reg_id {
@@ -1185,24 +1168,7 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
         return Ok(());
     }
 
-    // Intercept zxdg_output_manager_v1 when it's NOT available from the
-    // compositor (e.g. Mutter/GNOME). We detect this by checking if the
-    // compositor has it in its globals. If it does (Hyprland), forward it.
-    // If it doesn't (Mutter), intercept and serve synthetic events.
-    let comp_has_zxdg_output = s.comp_globals.iter().any(|g| g.interface == "zxdg_output_manager_v1");
-    if iface_from_wire.as_deref() == Some("zxdg_output_manager_v1") && !comp_has_zxdg_output {
-        info!("  🎣 intercepted bind for zxdg_output_manager_v1 → cli_oid={new_id} (compositor doesn't have it)");
-        let already_tracked = s.fake_objects.iter().any(|f| f.cli_oid == new_id);
-        if !already_tracked {
-            s.fake_objects.push(FakeObject {
-                cli_oid: new_id,
-                iface: "zxdg_output_manager_v1".into(),
-                next_sub_oid: new_id + 1,
-                data: String::new(),
-            });
-        }
-        return Ok(());
-    }
+    // zxdg_output_manager_v1: always forward to Mutter
 
     let global = s.comp_globals.iter().find(|g| g.name == global_name);
     let iface = global.map(|g| g.interface.as_str()).unwrap_or("?");
@@ -1828,13 +1794,6 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
         let pay = &msg.raw[8..];
         if pay.len() >= 4 {
             let deleted_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-            // Reverse-remap deleted OID if it was a remapped sync callback
-            if let Some(&cli_oid) = s.sync_remap.get(&deleted_id) {
-                let mut remapped = msg.raw.clone();
-                remapped[8..12].copy_from_slice(&cli_oid.to_ne_bytes());
-                s.sync_remap.remove(&deleted_id);
-                return send_raw_raw(&s.to_cli, remapped, &msg.fds);
-            }
             if let Some(pos) = s.translation_map.iter().position(|e| e.cli_layer_surface_oid == deleted_id) {
                 info!("  Cleaning up translation for deleted OID {}", deleted_id);
                 s.translation_map.remove(pos);
@@ -1844,13 +1803,6 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
 
 
     debug!("comp -> cli: oid={}, op={}, size={} raw={:02x?}", oid, msg.opcode(), msg.raw.len(), &msg.raw[..msg.raw.len().min(32)]);
-
-    // Reverse remap for sync callback OIDs (remapped in wl_display.sync)
-    if let Some(&cli_oid) = s.sync_remap.get(&oid) {
-        let mut remapped = msg.raw.clone();
-        remapped[0..4].copy_from_slice(&cli_oid.to_ne_bytes());
-        return send_raw_raw(&s.to_cli, remapped, &msg.fds);
-    }
 
     if oid == 1 && msg.opcode() == 0 {
         let pay = &msg.raw[8..];
