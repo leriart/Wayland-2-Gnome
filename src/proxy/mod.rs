@@ -42,6 +42,27 @@ impl RawMsg {
     }
 }
 
+/// Buffer or forward a client message to the compositor based on init state.
+fn forward_to_mutter(s: &mut Session, raw: Vec<u8>, fds: &[OwnedFd]) -> Result<()> {
+    if !s.init_roundtrip_done {
+        debug!("  buffering msg ({} bytes)", raw.len());
+        s.pending_msgs.push(raw);
+        return Ok(());
+    }
+    send_raw_raw(&s.to_comp, raw, fds)
+}
+
+/// Drain buffered messages after roundtrip completes.
+fn drain_pending(s: &mut Session) -> Result<()> {
+    let pending = std::mem::take(&mut s.pending_msgs);
+    if pending.is_empty() { return Ok(()); }
+    info!("Draining {} buffered messages after roundtrip", pending.len());
+    for raw in pending {
+        send_raw_raw(&s.to_comp, raw, &[])?;
+    }
+    Ok(())
+}
+
 pub fn make_raw(oid: u32, op: u16, pay: &[u8]) -> Vec<u8> {
     let total = 8u32 + pay.len() as u32;
     let mut m = Vec::with_capacity(total as usize);
@@ -363,6 +384,12 @@ struct Session {
     translation_map: Vec<TranslationEntry>,
     /// All registry object IDs (client-side) created by this client.
     all_registry_ids: Vec<u32>,
+    /// Buffered client messages during init (held until first roundtrip completes).
+    pending_msgs: Vec<Vec<u8>>,
+    /// First compositor roundtrip completed (callback.done received).
+    init_roundtrip_done: bool,
+    /// OID of the first sync callback (to detect when roundtrip completes).
+    first_sync_cb_oid: u32,
 }
 
 #[derive(Clone)]
@@ -670,6 +697,9 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         output_events_delivered: false,
         monitors: Vec::new(),
         all_registry_ids: Vec::new(),
+        pending_msgs: Vec::new(),
+        init_roundtrip_done: false,
+        first_sync_cb_oid: 0,
 
     };
 
@@ -1040,7 +1070,7 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                     }
                     info!("  bind on registry oid={}: name={}, iface='{}', new_id={}, cli_v={}, comp_v={}",
                         oid, bind_name, iface_str, bind_new_id, bind_version, comp_version);
-                    return send_raw_raw(&s.to_comp, raw, &msg.fds);
+                    return forward_to_mutter(s, raw, &msg.fds);
                 } else {
                     info!("  blocking bind to unknown global name={} on registry oid={}", bind_name, oid);
                     return Ok(());
@@ -1063,10 +1093,14 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         return handle_fake_msg(s, &fake, msg);
     }
 
-    // Debug: log wl_display.sync messages
+    // wl_display.sync: forward immediately (must not be buffered)
     if oid == 1 && op == 0 && msg.raw.len() >= 12 {
         let cb_new_id = u32::from_ne_bytes([msg.raw[8], msg.raw[9], msg.raw[10], msg.raw[11]]);
         info!("  wl_display.sync(callback={})", cb_new_id);
+        if s.first_sync_cb_oid == 0 {
+            s.first_sync_cb_oid = cb_new_id;
+        }
+        return send_raw(&s.to_comp, msg);
     }
 
     // Everything else: forward raw
@@ -1221,11 +1255,11 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
         let mut clamped = msg.raw.clone();
         let raw_ver_offset = 8 + 8 + str_padded; // msg.raw[8+8+str_padded]
         clamped[raw_ver_offset..raw_ver_offset+4].copy_from_slice(&comp_version.to_ne_bytes());
-        return send_raw_raw(&s.to_comp, clamped, &msg.fds);
+        return forward_to_mutter(s, clamped, &msg.fds);
     }
 
     // Forward to compositor
-    send_raw(&s.to_comp, msg)
+    forward_to_mutter(s, msg.raw.clone(), &msg.fds)
 }
 
 /// Handle a message targeting a fake bridge-managed object.
@@ -1727,6 +1761,16 @@ fn handle_layer_surface_request(s: &mut Session, fake: &FakeObject, msg: &RawMsg
 fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let oid = msg.object_id();
     let op = msg.opcode();
+
+    // First callback.done from Mutter = initial roundtrip complete.
+    // Drain buffered client messages now that globals are fully advertised.
+    if !s.init_roundtrip_done && s.first_sync_cb_oid != 0 && oid == s.first_sync_cb_oid && op == 0 {
+        info!("Init roundtrip complete (callback.done on oid={}). Draining buffer.", oid);
+        s.init_roundtrip_done = true;
+        if let Err(e) = drain_pending(s) {
+            error!("Failed to drain pending msgs: {e}");
+        }
+    }
 
     if s.tracked_outputs.iter().any(|t| t.comp_oid == oid) {
         sniff_output_event(s, oid, op, &msg.raw[8..]);
