@@ -380,6 +380,8 @@ struct Session {
     translation_map: Vec<TranslationEntry>,
     /// All registry object IDs (client-side) created by this client.
     all_registry_ids: Vec<u32>,
+    /// Highest OID forwarded to Mutter (for gap detection before syncs)
+    mutter_max_oid: u32,
 }
 
 #[derive(Clone)]
@@ -687,6 +689,7 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         output_events_delivered: false,
         monitors: Vec::new(),
         all_registry_ids: Vec::new(),
+        mutter_max_oid: 2,
 
     };
 
@@ -1029,13 +1032,9 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             if bind_new_id > 0 && !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
                 s.fake_objects.push(FakeObject { cli_oid: bind_new_id, iface: "zwlr_layer_shell_v1".into(), next_sub_oid: bind_new_id + 1, data: String::new() });
             }
-            // Forward a dummy wl_compositor bind to Mutter at the same OID
-            // to fill the gap. Mutter requires contiguous OIDs and this OID
-            // would otherwise be skipped.
-            if oid == s.cli_reg_id {
-                let fill = make_raw(oid, 0, &make_bind_payload(1, "wl_compositor", 1, bind_new_id));
-                let _ = send_raw_raw(&s.to_comp, fill, &[]);
-            }
+            // Forward a dummy wl_compositor bind to fill the OID gap on Mutter.
+            let fill = make_raw(oid, 0, &make_bind_payload(1, "wl_compositor", 1, bind_new_id));
+            let _ = send_raw_raw(&s.to_comp, fill, &[]);
             return Ok(());
         }
         
@@ -1079,10 +1078,20 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         return handle_fake_msg(s, &fake, msg);
     }
 
-    // Debug: log wl_display.sync messages
+    // wl_display.sync: forward to Mutter, filling any OID gaps first.
     if oid == 1 && op == 0 && msg.raw.len() >= 12 {
         let cb_new_id = u32::from_ne_bytes([msg.raw[8], msg.raw[9], msg.raw[10], msg.raw[11]]);
         info!("  wl_display.sync(callback={})", cb_new_id);
+        // Fill OID gap if this sync callback OID skipped some values
+        if cb_new_id > s.mutter_max_oid + 1 {
+            for fill in (s.mutter_max_oid + 1)..cb_new_id {
+                info!("  filling OID gap before sync: {} (dummy wl_compositor)", fill);
+                let f = make_raw(s.cli_reg_id, 0, &make_bind_payload(1, "wl_compositor", 1, fill));
+                let _ = send_raw_raw(&s.to_comp, f, &[]);
+            }
+        }
+        if cb_new_id > s.mutter_max_oid { s.mutter_max_oid = cb_new_id; }
+        return send_raw(&s.to_comp, msg);
     }
 
     // Everything else: forward raw
@@ -1243,7 +1252,8 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
         return send_raw_raw(&s.to_comp, clamped, &msg.fds);
     }
 
-    // Forward to compositor
+    // Track OID and forward to compositor
+    if new_id > s.mutter_max_oid { s.mutter_max_oid = new_id; }
     send_raw(&s.to_comp, msg)
 }
 
