@@ -42,37 +42,6 @@ impl RawMsg {
     }
 }
 
-/// Buffer or forward a client message to the compositor based on init state.
-fn forward_to_mutter(s: &mut Session, raw: Vec<u8>, fds: &[OwnedFd]) -> Result<()> {
-    if !s.init_roundtrip_done {
-        debug!("  buffering msg ({} bytes)", raw.len());
-        s.pending_msgs.push(raw);
-        return Ok(());
-    }
-    send_raw_raw(&s.to_comp, raw, fds)
-}
-
-/// Drain buffered messages after roundtrip completes.
-/// Sends a sync to Mutter after draining to ensure all objects are created
-/// before the client sends more messages.
-fn drain_pending(s: &mut Session) -> Result<()> {
-    let pending = std::mem::take(&mut s.pending_msgs);
-    if pending.is_empty() { return Ok(()); }
-    info!("Draining {} buffered messages after roundtrip", pending.len());
-    for raw in pending {
-        send_raw_raw(&s.to_comp, raw, &[])?;
-    }
-    // Send a sync to flush Mutter's queue. We'll wait for callback.done
-    // before allowing the client to send more messages.
-    let sync_oid = s.next_oid;
-    s.next_oid += 1;
-    s.drain_sync_cb_oid = sync_oid;
-    info!("  sent drain sync(callback={}) to flush Mutter", sync_oid);
-    let sync_msg = make_raw(1, 0, &sync_oid.to_ne_bytes());
-    send_raw_raw(&s.to_comp, sync_msg, &[])?;
-    Ok(())
-}
-
 pub fn make_raw(oid: u32, op: u16, pay: &[u8]) -> Vec<u8> {
     let total = 8u32 + pay.len() as u32;
     let mut m = Vec::with_capacity(total as usize);
@@ -394,14 +363,6 @@ struct Session {
     translation_map: Vec<TranslationEntry>,
     /// All registry object IDs (client-side) created by this client.
     all_registry_ids: Vec<u32>,
-    /// Buffered client messages during init (held until first roundtrip completes).
-    pending_msgs: Vec<Vec<u8>>,
-    /// First compositor roundtrip completed (callback.done received).
-    init_roundtrip_done: bool,
-    /// OID of the first sync callback (to detect when roundtrip completes).
-    first_sync_cb_oid: u32,
-    /// OID of a drain-roundtrip sync callback (sent after draining to flush Mutter).
-    drain_sync_cb_oid: u32,
 }
 
 #[derive(Clone)]
@@ -709,12 +670,25 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         output_events_delivered: false,
         monitors: Vec::new(),
         all_registry_ids: Vec::new(),
-        pending_msgs: Vec::new(),
-        init_roundtrip_done: false,
-        first_sync_cb_oid: 0,
-        drain_sync_cb_oid: 0,
 
     };
+
+    // Inject fake layer_shell global BEFORE event loop starts.
+    // This puts it in the client's receive buffer immediately, so the
+    // client sees it before any compositor globals arrive.
+    // We send it with a placeholder registry OID that will be valid
+    // once the client sends get_registry (first message after connect).
+    info!("Pre-injecting fake layer_shell global on client socket");
+    let pre_evt = make_global_event(2, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
+    let _ = send_raw(&s.to_cli, &RawMsg { raw: pre_evt, fds: Vec::new() });
+    s.injected_layer_shell = true;
+    s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
+    // Also add to comp_globals so maybe_inject_layer_shell doesn't duplicate
+    s.comp_globals.push(GlobalInfo {
+        name: FAKE_GLOBAL_LAYER_SHELL,
+        interface: "zwlr_layer_shell_v1".into(),
+        version: LAYER_SHELL_VERSION,
+    });
 
     // Use calloop-based event loop for this session.
     let mut evloop: EventLoop<Session> = EventLoop::try_new()?;
@@ -1030,10 +1004,6 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.injected_layer_shell = true;
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
-            // Yield to let client process fake layer_shell global before sending binds.
-            // Without this, the client may send binds that reference globals it hasn't 
-            // processed yet, causing Mutter to reject them.
-            std::thread::sleep(std::time::Duration::from_millis(5));
         } else {
             // Secondary registry: forward + inject layer_shell.
             // gtk-layer-shell creates its OWN registry via GDK to bind layer_shell.
@@ -1042,10 +1012,6 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
             send_raw(&s.to_comp, msg)?;
-            // Yield to let client process fake layer_shell global before sending binds.
-            // Without this, the client may send binds that reference globals it hasn't 
-            // processed yet, causing Mutter to reject them.
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         return Ok(());
     }
@@ -1066,7 +1032,7 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             return Ok(());
         }
         
-        // zxdg_output_manager_v1: forward to compositor (Mutter provides it)
+        // zxdg_output_manager_v1: forward to compositor
 
         // NON-PRIMARY REGISTRIES: forward binds to compositor with version clamping.
         // (The primary registry goes through handle_bind below, which does the same.)
@@ -1083,7 +1049,7 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                     }
                     info!("  bind on registry oid={}: name={}, iface='{}', new_id={}, cli_v={}, comp_v={}",
                         oid, bind_name, iface_str, bind_new_id, bind_version, comp_version);
-                    return forward_to_mutter(s, raw, &msg.fds);
+                    return send_raw_raw(&s.to_comp, raw, &msg.fds);
                 } else {
                     info!("  blocking bind to unknown global name={} on registry oid={}", bind_name, oid);
                     return Ok(());
@@ -1106,14 +1072,10 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         return handle_fake_msg(s, &fake, msg);
     }
 
-    // wl_display.sync: forward immediately (must not be buffered)
+    // Debug: log wl_display.sync messages
     if oid == 1 && op == 0 && msg.raw.len() >= 12 {
         let cb_new_id = u32::from_ne_bytes([msg.raw[8], msg.raw[9], msg.raw[10], msg.raw[11]]);
         info!("  wl_display.sync(callback={})", cb_new_id);
-        if s.first_sync_cb_oid == 0 {
-            s.first_sync_cb_oid = cb_new_id;
-        }
-        return send_raw(&s.to_comp, msg);
     }
 
     // Everything else: forward raw
@@ -1268,11 +1230,11 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
         let mut clamped = msg.raw.clone();
         let raw_ver_offset = 8 + 8 + str_padded; // msg.raw[8+8+str_padded]
         clamped[raw_ver_offset..raw_ver_offset+4].copy_from_slice(&comp_version.to_ne_bytes());
-        return forward_to_mutter(s, clamped, &msg.fds);
+        return send_raw_raw(&s.to_comp, clamped, &msg.fds);
     }
 
     // Forward to compositor
-    forward_to_mutter(s, msg.raw.clone(), &msg.fds)
+    send_raw(&s.to_comp, msg)
 }
 
 /// Handle a message targeting a fake bridge-managed object.
@@ -1775,23 +1737,6 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let oid = msg.object_id();
     let op = msg.opcode();
 
-    // First callback.done from Mutter = initial roundtrip complete.
-    // Drain buffered client messages now that globals are fully advertised.
-    if !s.init_roundtrip_done && s.first_sync_cb_oid != 0 && oid == s.first_sync_cb_oid && op == 0 {
-        info!("Init roundtrip complete (callback.done on oid={}). Draining buffer.", oid);
-        s.init_roundtrip_done = true;
-        if let Err(e) = drain_pending(s) {
-            error!("Failed to drain pending msgs: {e}");
-        }
-    }
-
-    // Drain sync callback.done: Mutter has processed all buffered messages.
-    // Consume this event internally; do NOT forward to the client.
-    if s.drain_sync_cb_oid != 0 && oid == s.drain_sync_cb_oid && op == 0 {
-        info!("Drain sync complete (callback.done on oid={}). Mutter is caught up.", oid);
-        return Ok(());  // consume callback.done, don't forward. Clear on delete_id.
-    }
-
     if s.tracked_outputs.iter().any(|t| t.comp_oid == oid) {
         sniff_output_event(s, oid, op, &msg.raw[8..]);
     }
@@ -1858,12 +1803,6 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
         let pay = &msg.raw[8..];
         if pay.len() >= 4 {
             let deleted_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
-            // Consume delete_id for our internal drain sync callback
-            if s.drain_sync_cb_oid != 0 && deleted_id == s.drain_sync_cb_oid {
-                info!("  Drain sync cleaned up (delete_id({})). Mutter fully synced.", deleted_id);
-                s.drain_sync_cb_oid = 0;
-                return Ok(());
-            }
             if let Some(pos) = s.translation_map.iter().position(|e| e.cli_layer_surface_oid == deleted_id) {
                 info!("  Cleaning up translation for deleted OID {}", deleted_id);
                 s.translation_map.remove(pos);
