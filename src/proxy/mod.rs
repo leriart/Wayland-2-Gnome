@@ -327,49 +327,9 @@ struct FakeObject {
     data: String,
 }
 
-/// Per-registry state with dedicated compositor connection.
-struct RegistryConn {
-    to_comp: UnixStream,
-    cli_reg_id: u32,
-    comp_globals: Vec<GlobalInfo>,
-    globals_collected: bool,
-    injected_layer_shell: bool,
-    fake_objects: Vec<FakeObject>,
-    fake_global_name: Option<u32>,
-    cli_xdg_wm_base_id: u32,
-    comp_dec_mgr_id: u32,
-    comp_dec_mgr_name: u32,
-    comp_compositor_id: u32,
-    comp_compositor_name: u32,
-}
-
-impl RegistryConn {
-    fn new(to_comp: UnixStream) -> Self {
-        Self {
-            to_comp,
-            cli_reg_id: 0,
-            comp_globals: Vec::new(),
-            globals_collected: false,
-            injected_layer_shell: false,
-            fake_objects: Vec::new(),
-            fake_global_name: None,
-            cli_xdg_wm_base_id: 0,
-            comp_dec_mgr_id: 0,
-            comp_dec_mgr_name: 0,
-            comp_compositor_id: 0,
-            comp_compositor_name: 0,
-        }
-    }
-}
-
 struct Session {
     to_cli: UnixStream,
     to_comp: UnixStream,
-    /// Additional registries with dedicated compositor connections.
-    secondary: Vec<RegistryConn>,
-    /// Maps client-side registry OID → index in secondary.
-    oid_map: HashMap<u32, usize>,
-    compositor_path: String,
     /// Globals we've sniffed from compositor→client registry events.
     comp_globals: Vec<GlobalInfo>,
     /// The client's first registry object ID (set by get_registry).
@@ -689,9 +649,6 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
     let mut s = Session {
         to_cli,
         to_comp,
-        secondary: Vec::new(),
-        oid_map: HashMap::new(),
-        compositor_path: comp_path,
         comp_globals: Vec::new(),
         cli_reg_id: 0,
         comp_reg_id: 0,
@@ -821,44 +778,7 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
     loop {
         let _ = evloop.dispatch(Some(Duration::from_millis(200)), &mut s);
         
-        // Drain secondary compositor events (non-blocking reads)
-        let mut sec_idx = 0;
-        while sec_idx < s.secondary.len() {
-            let fd = s.secondary[sec_idx].to_comp.as_raw_fd();
-            // Try to read one message (non-blocking probe first)
-            let mut peek = [0u8; 1];
-            let avail = unsafe { libc::recv(fd, peek.as_mut_ptr() as *mut _, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
-            if avail <= 0 {
-                sec_idx += 1;
-                continue; // nothing available on this FD
-            }
-            // Read a complete message
-            match read_raw(&s.secondary[sec_idx].to_comp) {
-                Ok(msg) => {
-                    let oid = msg.object_id();
-                    let op = msg.opcode();
-                    // Protocol error from secondary compositor
-                    if oid == 1 && op == 0 {
-                        let pay = &msg.raw[8..];
-                        let err_oid = if pay.len() >= 4 { u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]) } else { 0 };
-                        let err_code = if pay.len() >= 8 { u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]) } else { 0 };
-                        let err_msg = if pay.len() > 12 {
-                            let slen = u32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]) as usize;
-                            if 12 + slen <= pay.len() { String::from_utf8_lossy(&pay[12..12+slen]).trim_end_matches('\0').to_string() } else { String::new() }
-                        } else { String::new() };
-                        error!("COMPOSITOR PROTOCOL ERROR (secondary idx={}): object={}, code={}, msg='{}'", sec_idx, err_oid, err_code, err_msg);
-                    }
-                    // Forward to client
-                    let _ = send_raw(&s.to_cli, &msg);
-                }
-                Err(e) => {
-                    info!("Secondary compositor EOF (idx={}): {e}", sec_idx);
-                    s.secondary.remove(sec_idx);
-                    continue; // don't increment idx — next item shifted into this position
-                }
-            }
-            sec_idx += 1;
-        }
+        // Secondary registries are handled via fake objects - no compositor connection to drain
         
         if signal.lock().unwrap().is_none() || SHUTDOWN_FLAG.load(Ordering::Relaxed) {
             break;
@@ -1076,33 +996,12 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
         } else {
-            // Secondary registry: open a new compositor connection
-            let sec_idx = s.secondary.len();
-            info!("Opening NEW compositor connection for secondary registry id={} (idx={})", new_id, sec_idx);
-            match std::os::unix::net::UnixStream::connect(std::path::Path::new(&s.compositor_path)) {
-                Ok(comp) => {
-                    comp.set_nonblocking(false).ok();
-                    let mut reg = RegistryConn::new(comp);
-                    reg.cli_reg_id = new_id;
-                    
-                    // Inject fake layer_shell on this registry
-                    let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
-                    let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-                    reg.injected_layer_shell = true;
-                    reg.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
-                    
-                    // Forward get_registry to this registry's compositor connection
-                    send_raw(&reg.to_comp, msg)?;
-                    
-                    // Track registry OID → connection index
-                    s.oid_map.insert(new_id, sec_idx);
-                    s.secondary.push(reg);
-                }
-                Err(e) => {
-                    error!("Failed to connect compositor for secondary registry {}: {}", new_id, e);
-                    send_raw(&s.to_comp, msg)?;
-                }
-            }
+            // Secondary registry: DON'T forward to compositor.
+            // The registry's OID stays free on the compositor, so surfaces and callbacks
+            // won't collide with it. All binds on this registry are intercepted as fakes.
+            info!("Intercepting get_registry for secondary registry id={} (no compositor forward)", new_id);
+            let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
+            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
         }
         return Ok(());
     }
@@ -1188,9 +1087,9 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                             oid, bind_name, iface_str, bind_new_id, bind_version);
                     }
                     // Route to the DEDICATED compositor connection for this registry
-                    if let Some(&sec_idx) = s.oid_map.get(&oid) {
-                        if sec_idx < s.secondary.len() {
-                            return send_raw_raw(&s.secondary[sec_idx].to_comp, raw, &msg.fds);
+                    if false {
+                        if false {
+                            return send_raw_raw(&s.to_comp, raw, &msg.fds);
                         }
                     }
                     return send_raw_raw(&s.to_comp, raw, &msg.fds);
