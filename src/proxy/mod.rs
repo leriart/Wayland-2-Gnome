@@ -327,38 +327,49 @@ struct FakeObject {
     data: String,
 }
 
-/// OID remapping: tracks which client-side OIDs have been remapped
-/// when a non-primary registry binds a global at an already-used OID.
-struct OidRemap {
-    /// client_oid -> compositor_oid
-    to_comp: HashMap<u32, u32>,
-    /// compositor_oid -> client_oid
-    to_cli: HashMap<u32, u32>,
-    /// client_oid -> interface name (so we know how to rewrite payload new_ids)
-    iface: HashMap<u32, String>,
+/// Per-registry state with dedicated compositor connection.
+struct RegistryConn {
+    to_comp: UnixStream,
+    cli_reg_id: u32,
+    comp_globals: Vec<GlobalInfo>,
+    globals_collected: bool,
+    injected_layer_shell: bool,
+    fake_objects: Vec<FakeObject>,
+    fake_global_name: Option<u32>,
+    cli_xdg_wm_base_id: u32,
+    comp_dec_mgr_id: u32,
+    comp_dec_mgr_name: u32,
+    comp_compositor_id: u32,
+    comp_compositor_name: u32,
 }
 
-impl OidRemap {
-    fn new() -> Self {
-        Self { to_comp: HashMap::new(), to_cli: HashMap::new(), iface: HashMap::new() }
-    }
-    fn insert(&mut self, cli_oid: u32, comp_oid: u32, iface_name: String) {
-        self.to_comp.insert(cli_oid, comp_oid);
-        self.to_cli.insert(comp_oid, cli_oid);
-        self.iface.insert(cli_oid, iface_name);
-    }
-    fn remap_header(&self, oid: u32, in_reverse: bool) -> Option<u32> {
-        if in_reverse { self.to_cli.get(&oid).copied() }
-        else { self.to_comp.get(&oid).copied() }
-    }
-    fn get_iface(&self, cli_oid: u32) -> Option<&str> {
-        self.iface.get(&cli_oid).map(|s| s.as_str())
+impl RegistryConn {
+    fn new(to_comp: UnixStream) -> Self {
+        Self {
+            to_comp,
+            cli_reg_id: 0,
+            comp_globals: Vec::new(),
+            globals_collected: false,
+            injected_layer_shell: false,
+            fake_objects: Vec::new(),
+            fake_global_name: None,
+            cli_xdg_wm_base_id: 0,
+            comp_dec_mgr_id: 0,
+            comp_dec_mgr_name: 0,
+            comp_compositor_id: 0,
+            comp_compositor_name: 0,
+        }
     }
 }
 
 struct Session {
     to_cli: UnixStream,
     to_comp: UnixStream,
+    /// Additional registries with dedicated compositor connections.
+    secondary: Vec<RegistryConn>,
+    /// Maps client-side registry OID → index in secondary.
+    oid_map: HashMap<u32, usize>,
+    compositor_path: String,
     /// Globals we've sniffed from compositor→client registry events.
     comp_globals: Vec<GlobalInfo>,
     /// The client's first registry object ID (set by get_registry).
@@ -391,8 +402,6 @@ struct Session {
     comp_compositor_name: u32,
     /// Translation map: client ID (LayerSurface) -> compositor IDs (XDG Surface, Toplevel)
     translation_map: Vec<TranslationEntry>,
-    // --- OID remapping for non-primary registries ---
-    oid_remap: OidRemap,
     /// All registry object IDs (client-side) created by this client.
     all_registry_ids: Vec<u32>,
 }
@@ -672,9 +681,17 @@ fn make_delete_id(display_oid: u32, id: u32) -> Vec<u8> {
 // ─── Session loop ───────────────────────────────────────────────────────────
 
 fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
+    let rdir = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| "/run/user/1000".to_string());
+    let comp_display = std::env::var("WAYLAND_DISPLAY")
+        .unwrap_or_else(|_| "wayland-0".to_string());
+    let comp_path = format!("{rdir}/{comp_display}");
     let mut s = Session {
         to_cli,
         to_comp,
+        secondary: Vec::new(),
+        oid_map: HashMap::new(),
+        compositor_path: comp_path,
         comp_globals: Vec::new(),
         cli_reg_id: 0,
         comp_reg_id: 0,
@@ -692,7 +709,6 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         tracked_outputs: Vec::new(),
         output_events_delivered: false,
         monitors: Vec::new(),
-        oid_remap: OidRemap::new(),
         all_registry_ids: Vec::new(),
 
     };
@@ -804,6 +820,46 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
     // Dispatch until LoopSignal::stop() is called OR shutdown flag is set
     loop {
         let _ = evloop.dispatch(Some(Duration::from_millis(200)), &mut s);
+        
+        // Drain secondary compositor events (non-blocking reads)
+        let mut sec_idx = 0;
+        while sec_idx < s.secondary.len() {
+            let fd = s.secondary[sec_idx].to_comp.as_raw_fd();
+            // Try to read one message (non-blocking probe first)
+            let mut peek = [0u8; 1];
+            let avail = unsafe { libc::recv(fd, peek.as_mut_ptr() as *mut _, 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+            if avail <= 0 {
+                sec_idx += 1;
+                continue; // nothing available on this FD
+            }
+            // Read a complete message
+            match read_raw(&s.secondary[sec_idx].to_comp) {
+                Ok(msg) => {
+                    let oid = msg.object_id();
+                    let op = msg.opcode();
+                    // Protocol error from secondary compositor
+                    if oid == 1 && op == 0 {
+                        let pay = &msg.raw[8..];
+                        let err_oid = if pay.len() >= 4 { u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]) } else { 0 };
+                        let err_code = if pay.len() >= 8 { u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]) } else { 0 };
+                        let err_msg = if pay.len() > 12 {
+                            let slen = u32::from_ne_bytes([pay[8], pay[9], pay[10], pay[11]]) as usize;
+                            if 12 + slen <= pay.len() { String::from_utf8_lossy(&pay[12..12+slen]).trim_end_matches('\0').to_string() } else { String::new() }
+                        } else { String::new() };
+                        error!("COMPOSITOR PROTOCOL ERROR (secondary idx={}): object={}, code={}, msg='{}'", sec_idx, err_oid, err_code, err_msg);
+                    }
+                    // Forward to client
+                    let _ = send_raw(&s.to_cli, &msg);
+                }
+                Err(e) => {
+                    info!("Secondary compositor EOF (idx={}): {e}", sec_idx);
+                    s.secondary.remove(sec_idx);
+                    continue; // don't increment idx — next item shifted into this position
+                }
+            }
+            sec_idx += 1;
+        }
+        
         if signal.lock().unwrap().is_none() || SHUTDOWN_FLAG.load(Ordering::Relaxed) {
             break;
         }
@@ -1020,19 +1076,33 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
         } else {
-            // Secondary registry: inject fake layer_shell on client-side OID
-            info!("Injecting fake layer_shell global (name={}) on secondary registry id={}",
-                FAKE_GLOBAL_LAYER_SHELL, new_id);
-            let evt = make_global_event(
-                new_id,
-                FAKE_GLOBAL_LAYER_SHELL,
-                LAYER_SHELL_IFACE,
-                LAYER_SHELL_VERSION,
-            );
-            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-            // Forward the get_registry as-is — the client's OIDs are already unique within
-            // this connection (the client library manages this). Only BINDS cause collisions.
-            send_raw(&s.to_comp, msg)?;
+            // Secondary registry: open a new compositor connection
+            let sec_idx = s.secondary.len();
+            info!("Opening NEW compositor connection for secondary registry id={} (idx={})", new_id, sec_idx);
+            match std::os::unix::net::UnixStream::connect(std::path::Path::new(&s.compositor_path)) {
+                Ok(comp) => {
+                    comp.set_nonblocking(false).ok();
+                    let mut reg = RegistryConn::new(comp);
+                    reg.cli_reg_id = new_id;
+                    
+                    // Inject fake layer_shell on this registry
+                    let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
+                    let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
+                    reg.injected_layer_shell = true;
+                    reg.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
+                    
+                    // Forward get_registry to this registry's compositor connection
+                    send_raw(&reg.to_comp, msg)?;
+                    
+                    // Track registry OID → connection index
+                    s.oid_map.insert(new_id, sec_idx);
+                    s.secondary.push(reg);
+                }
+                Err(e) => {
+                    error!("Failed to connect compositor for secondary registry {}: {}", new_id, e);
+                    send_raw(&s.to_comp, msg)?;
+                }
+            }
         }
         return Ok(());
     }
@@ -1117,6 +1187,12 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                         info!("  forwarding bind on secondary registry oid={}: name={}, iface='{}', new_id={}, v{}",
                             oid, bind_name, iface_str, bind_new_id, bind_version);
                     }
+                    // Route to the DEDICATED compositor connection for this registry
+                    if let Some(&sec_idx) = s.oid_map.get(&oid) {
+                        if sec_idx < s.secondary.len() {
+                            return send_raw_raw(&s.secondary[sec_idx].to_comp, raw, &msg.fds);
+                        }
+                    }
                     return send_raw_raw(&s.to_comp, raw, &msg.fds);
                 } else {
                     info!("  blocking bind to unknown global name={} on secondary registry oid={}", bind_name, oid);
@@ -1138,17 +1214,6 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         // Clone the fake object info so we can drop the immutable borrow
         let fake = s.fake_objects[idx].clone();
         return handle_fake_msg(s, &fake, msg);
-    }
-
-    // Dynamic detection for get_layer_surface was removed.
-    // Now handled by early injection + bind pre-check interception.
-
-
-    // Check if this is a remapped OID from a non-primary registry
-    if let Some(&comp_oid) = s.oid_remap.to_comp.get(&oid) {
-        // Rewrite header OID and handle payload new_ids
-        let remapped = rewrite_message_for_remap(s, comp_oid, msg);
-        return send_raw_raw(&s.to_comp, remapped, &msg.fds);
     }
 
     // Debug: log wl_display.sync messages
@@ -1199,65 +1264,6 @@ fn find_version_offset_in_bind(pay: &[u8]) -> Option<usize> {
     let str_padded = (slen + 3) & !3;
     let ver_offset = 8 + str_padded;
     if ver_offset + 4 <= pay.len() { Some(ver_offset) } else { None }
-}
-
-/// Rewrite a message targeting a remapped OID.
-/// Rewrites the header OID and any create-* new_ids in the payload.
-/// NOTE: s.next_oid is incremented inside when we allocate new compositor OIDs.
-fn rewrite_message_for_remap(s: &mut Session, comp_oid: u32, msg: &RawMsg) -> Vec<u8> {
-    let oid = msg.object_id();
-    let op = msg.opcode();
-    let mut raw = msg.raw.clone();
-    raw[0..4].copy_from_slice(&comp_oid.to_ne_bytes());
-    
-    // Check if this remapped parent OID creates new objects (new_ids in payload)
-    if let Some(iface) = s.oid_remap.get_iface(oid) {
-        match iface {
-            "wl_compositor" => {
-                // op 0: create_surface(new_id) — new_id at offset 8
-                // op 1: create_region(new_id) — new_id at offset 8
-                if (op == 0 || op == 1) && raw.len() >= 12 {
-                    let cli_new = u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]);
-                    let comp_new = s.next_oid;
-                    s.next_oid += 1;
-                    raw[8..12].copy_from_slice(&comp_new.to_ne_bytes());
-                    let child_iface = if op == 0 { "wl_surface" } else { "wl_region" };
-                    s.oid_remap.insert(cli_new, comp_new, child_iface.to_string());
-                    debug!("  remapped {}({}) client_oid={} -> comp_oid={}",
-                        child_iface, op, cli_new, comp_new);
-                }
-            }
-            "wl_shm" => {
-                // op 0: create_pool(new_id, fd, size) — new_id at offset 8
-                if op == 0 && raw.len() >= 12 {
-                    let cli_new = u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]);
-                    let comp_new = s.next_oid;
-                    s.next_oid += 1;
-                    raw[8..12].copy_from_slice(&comp_new.to_ne_bytes());
-                    s.oid_remap.insert(cli_new, comp_new, "wl_shm_pool".to_string());
-                    debug!("  remapped wl_shm.create_pool client_oid={} -> comp_oid={}", cli_new, comp_new);
-                }
-            }
-            _ => {}
-        }
-    }
-    
-    // Also remap any wl_surface OIDs in the payload for known message types
-    // e.g., xdg_wm_base.get_xdg_surface has surface_oid at offset 12
-    if iface_name_for_oid(s, &oid).as_deref() == Some("xdg_wm_base") && op == 2 && raw.len() >= 16 {
-        let surf_oid = u32::from_ne_bytes([raw[12], raw[13], raw[14], raw[15]]);
-        if let Some(&remapped_surf) = s.oid_remap.to_comp.get(&surf_oid) {
-            raw[12..16].copy_from_slice(&remapped_surf.to_ne_bytes());
-            debug!("  remapped xdg_wm_base.get_xdg_surface surface_oid={} -> {}", surf_oid, remapped_surf);
-        }
-    }
-    
-    raw
-}
-
-/// Get the interface name for a client-side OID (either from remap or translation context).
-fn iface_name_for_oid(s: &Session, oid: &u32) -> Option<String> {
-    s.oid_remap.iface.get(oid).cloned()
 }
 
 fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
@@ -1980,14 +1986,6 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
             debug!("  error string bytes: {:02x?} (pay offset 8+, {} bytes available)", &pay[8..], pay.len() - 8);
         }
         return send_raw(&s.to_cli, msg);
-    }
-
-    // Reverse OID remapping: if this compositor OID was remapped from a non-primary registry,
-    // rewrite the header back to the client's OID before forwarding.
-    if let Some(&cli_oid) = s.oid_remap.to_cli.get(&oid) {
-        let mut remapped = msg.raw.clone();
-        remapped[0..4].copy_from_slice(&cli_oid.to_ne_bytes());
-        return send_raw_raw(&s.to_cli, remapped, &msg.fds);
     }
 
     send_raw(&s.to_cli, msg)
