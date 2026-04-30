@@ -996,12 +996,11 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
         } else {
-            // Secondary registry: DON'T forward to compositor.
-            // The registry's OID stays free on the compositor, so surfaces and callbacks
-            // won't collide with it. All binds on this registry are intercepted as fakes.
-            info!("Intercepting get_registry for secondary registry id={} (no compositor forward)", new_id);
-            let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
-            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
+            // Secondary registry: forward to compositor normally.
+            // DON'T inject fake layer_shell here — GDK/Cairo just
+            // need xdg_wm_base and other standard globals.
+            info!("Forwarding get_registry for secondary registry id={}", new_id);
+            send_raw(&s.to_comp, msg)?;
         }
         return Ok(());
     }
@@ -1032,46 +1031,10 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             return Ok(());
         }
         
-        // NOTE: xdg_wm_base tracking for PRIMARY registry is handled by handle_bind.
-        // For non-primary registries, xdg_wm_base binds go through OID remapping below.
-        // We don't need special handling — the remapped xdg_wm_base will work as a
-        // normal compositor object on the shared connection.
-        
-        // NON-PRIMARY REGISTRIES: intercept xdg_wm_base and forward via primary.
-        // For all other globals, forward as-is.
+        // NON-PRIMARY REGISTRIES: forward binds to compositor with version clamping.
+        // (The primary registry goes through handle_bind below, which does the same.)
         if oid != s.cli_reg_id {
             if let Some(iface_str) = &bind_iface_str {
-                // NON-PRIMARY REGISTRIES: intercept problematic globals that fail
-                // when forwarded. xdg_wm_base and zxdg_output_manager_v1 both fail
-                // because their sub-requests reference OIDs from the primary's namespace.
-                if iface_str == "xdg_wm_base" && bind_new_id > 0 {
-                    info!("  intercepting xdg_wm_base on secondary registry oid={}: new_id={}, via primary oid={}",
-                        oid, bind_new_id, s.cli_xdg_wm_base_id);
-                    if !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
-                        s.fake_objects.push(FakeObject {
-                            cli_oid: bind_new_id,
-                            iface: "xdg_wm_base".into(),
-                            next_sub_oid: bind_new_id + 1,
-                            data: s.cli_xdg_wm_base_id.to_string(),
-                        });
-                    }
-                    return Ok(());
-                }
-                if iface_str == "zxdg_output_manager_v1" && bind_new_id > 0 {
-                    info!("  intercepting zxdg_output_manager_v1 on secondary registry oid={}: new_id={}",
-                        oid, bind_new_id);
-                    if !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
-                        s.fake_objects.push(FakeObject {
-                            cli_oid: bind_new_id,
-                            iface: "zxdg_output_manager_v1".into(),
-                            next_sub_oid: bind_new_id + 1,
-                            data: String::new(),
-                        });
-                    }
-                    return Ok(());
-                }
-                
-                // All other globals: forward to compositor with version clamping.
                 let known_global = s.comp_globals.iter().find(|g| g.name == bind_name);
                 if let Some(global) = known_global {
                     let comp_version = global.version;
@@ -1080,21 +1043,12 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
                         if let Some(ver_off) = find_version_offset_in_bind(&msg.raw[8..]) {
                             raw[8+ver_off..8+ver_off+4].copy_from_slice(&comp_version.to_ne_bytes());
                         }
-                        info!("  forwarding bind on secondary registry oid={}: name={}, iface='{}', new_id={}, clamped v{}->v{}",
-                            oid, bind_name, iface_str, bind_new_id, bind_version, comp_version);
-                    } else {
-                        info!("  forwarding bind on secondary registry oid={}: name={}, iface='{}', new_id={}, v{}",
-                            oid, bind_name, iface_str, bind_new_id, bind_version);
                     }
-                    // Route to the DEDICATED compositor connection for this registry
-                    if false {
-                        if false {
-                            return send_raw_raw(&s.to_comp, raw, &msg.fds);
-                        }
-                    }
+                    info!("  bind on registry oid={}: name={}, iface='{}', new_id={}, cli_v={}, comp_v={}",
+                        oid, bind_name, iface_str, bind_new_id, bind_version, comp_version);
                     return send_raw_raw(&s.to_comp, raw, &msg.fds);
                 } else {
-                    info!("  blocking bind to unknown global name={} on secondary registry oid={}", bind_name, oid);
+                    info!("  blocking bind to unknown global name={} on registry oid={}", bind_name, oid);
                     return Ok(());
                 }
             }
