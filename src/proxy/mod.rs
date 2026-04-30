@@ -1034,9 +1034,20 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         
         // zxdg_output_manager_v1: forward to compositor
 
-        // NON-PRIMARY REGISTRIES: always forward to Mutter.
-        // The compositor knows its globals better than our comp_globals cache.
+        // NON-PRIMARY REGISTRIES: forward with version clamping.
         if oid != s.cli_reg_id {
+            let comp_version = s.comp_globals.iter()
+                .find(|g| g.name == bind_name)
+                .map(|g| g.version).unwrap_or(1);
+            if bind_version > comp_version {
+                info!("  bind on registry oid={}: name={}, new_id={}, clamping v{}->v{}",
+                    oid, bind_name, bind_new_id, bind_version, comp_version);
+                let mut raw = msg.raw.clone();
+                if let Some(ver_off) = find_version_offset_in_bind(&msg.raw[8..]) {
+                    raw[8+ver_off..8+ver_off+4].copy_from_slice(&comp_version.to_ne_bytes());
+                }
+                return send_raw_raw(&s.to_comp, raw, &msg.fds);
+            }
             info!("  bind on registry oid={}: name={}, new_id={}, v={}", oid, bind_name, bind_new_id, bind_version);
             return send_raw(&s.to_comp, msg);
         }
