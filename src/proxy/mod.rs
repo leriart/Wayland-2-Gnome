@@ -1005,13 +1005,17 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
         } else {
-            // Secondary registry: forward + inject layer_shell.
-            // gtk-layer-shell creates its OWN registry via GDK to bind layer_shell.
-            // We must inject on ALL registries so GDK finds it.
-            info!("Forwarding get_registry for secondary registry id={} + layer_shell injection", new_id);
+            // Secondary registry: DON'T forward to Mutter. Only inject layer_shell.
+            // GDK creates its own registry just to find zwlr_layer_shell_v1.
+            // Forwarding secondary registries to Mutter causes OID collisions
+            // and duplicate protocol object errors.
+            info!("Secondary registry id={}: injecting layer_shell only (not forwarded to Mutter)", new_id);
             let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-            send_raw(&s.to_comp, msg)?;
+            // Inject a wl_display.delete_id to finalize the "dummy" registry.
+            // Without this the registry stays open on the client side.
+            // But we don't forward to Mutter, so no compositor-side registry exists.
+            // The client only uses this registry for layer_shell, which is intercepted.
         }
         return Ok(());
     }
