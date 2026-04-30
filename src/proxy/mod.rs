@@ -53,6 +53,8 @@ fn forward_to_mutter(s: &mut Session, raw: Vec<u8>, fds: &[OwnedFd]) -> Result<(
 }
 
 /// Drain buffered messages after roundtrip completes.
+/// Sends a sync to Mutter after draining to ensure all objects are created
+/// before the client sends more messages.
 fn drain_pending(s: &mut Session) -> Result<()> {
     let pending = std::mem::take(&mut s.pending_msgs);
     if pending.is_empty() { return Ok(()); }
@@ -60,6 +62,14 @@ fn drain_pending(s: &mut Session) -> Result<()> {
     for raw in pending {
         send_raw_raw(&s.to_comp, raw, &[])?;
     }
+    // Send a sync to flush Mutter's queue. We'll wait for callback.done
+    // before allowing the client to send more messages.
+    let sync_oid = s.next_oid;
+    s.next_oid += 1;
+    s.drain_sync_cb_oid = sync_oid;
+    info!("  sent drain sync(callback={}) to flush Mutter", sync_oid);
+    let sync_msg = make_raw(1, 0, &sync_oid.to_ne_bytes());
+    send_raw_raw(&s.to_comp, sync_msg, &[])?;
     Ok(())
 }
 
@@ -390,6 +400,8 @@ struct Session {
     init_roundtrip_done: bool,
     /// OID of the first sync callback (to detect when roundtrip completes).
     first_sync_cb_oid: u32,
+    /// OID of a drain-roundtrip sync callback (sent after draining to flush Mutter).
+    drain_sync_cb_oid: u32,
 }
 
 #[derive(Clone)]
@@ -700,6 +712,7 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         pending_msgs: Vec::new(),
         init_roundtrip_done: false,
         first_sync_cb_oid: 0,
+        drain_sync_cb_oid: 0,
 
     };
 
@@ -1772,6 +1785,13 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
         }
     }
 
+    // Drain sync callback.done: Mutter has processed all buffered messages.
+    // Consume this event internally; do NOT forward to the client.
+    if s.drain_sync_cb_oid != 0 && oid == s.drain_sync_cb_oid && op == 0 {
+        info!("Drain sync complete (callback.done on oid={}). Mutter is caught up.", oid);
+        return Ok(());  // consume callback.done, don't forward. Clear on delete_id.
+    }
+
     if s.tracked_outputs.iter().any(|t| t.comp_oid == oid) {
         sniff_output_event(s, oid, op, &msg.raw[8..]);
     }
@@ -1838,6 +1858,12 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
         let pay = &msg.raw[8..];
         if pay.len() >= 4 {
             let deleted_id = u32::from_ne_bytes([pay[0], pay[1], pay[2], pay[3]]);
+            // Consume delete_id for our internal drain sync callback
+            if s.drain_sync_cb_oid != 0 && deleted_id == s.drain_sync_cb_oid {
+                info!("  Drain sync cleaned up (delete_id({})). Mutter fully synced.", deleted_id);
+                s.drain_sync_cb_oid = 0;
+                return Ok(());
+            }
             if let Some(pos) = s.translation_map.iter().position(|e| e.cli_layer_surface_oid == deleted_id) {
                 info!("  Cleaning up translation for deleted OID {}", deleted_id);
                 s.translation_map.remove(pos);
