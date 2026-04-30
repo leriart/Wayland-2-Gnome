@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -325,12 +326,41 @@ struct FakeObject {
     data: String,
 }
 
+/// OID remapping: tracks which client-side OIDs have been remapped
+/// when a non-primary registry binds a global at an already-used OID.
+struct OidRemap {
+    /// client_oid -> compositor_oid
+    to_comp: HashMap<u32, u32>,
+    /// compositor_oid -> client_oid
+    to_cli: HashMap<u32, u32>,
+    /// client_oid -> interface name (so we know how to rewrite payload new_ids)
+    iface: HashMap<u32, String>,
+}
+
+impl OidRemap {
+    fn new() -> Self {
+        Self { to_comp: HashMap::new(), to_cli: HashMap::new(), iface: HashMap::new() }
+    }
+    fn insert(&mut self, cli_oid: u32, comp_oid: u32, iface_name: String) {
+        self.to_comp.insert(cli_oid, comp_oid);
+        self.to_cli.insert(comp_oid, cli_oid);
+        self.iface.insert(cli_oid, iface_name);
+    }
+    fn remap_header(&self, oid: u32, in_reverse: bool) -> Option<u32> {
+        if in_reverse { self.to_cli.get(&oid).copied() }
+        else { self.to_comp.get(&oid).copied() }
+    }
+    fn get_iface(&self, cli_oid: u32) -> Option<&str> {
+        self.iface.get(&cli_oid).map(|s| s.as_str())
+    }
+}
+
 struct Session {
     to_cli: UnixStream,
     to_comp: UnixStream,
     /// Globals we've sniffed from compositor→client registry events.
     comp_globals: Vec<GlobalInfo>,
-    /// The client's registry object ID (set by get_registry).
+    /// The client's first registry object ID (set by get_registry).
     cli_reg_id: u32,
     /// The registry object ID on the compositor side (same as cli_reg_id).
     comp_reg_id: u32,
@@ -360,6 +390,10 @@ struct Session {
     comp_compositor_name: u32,
     /// Translation map: client ID (LayerSurface) -> compositor IDs (XDG Surface, Toplevel)
     translation_map: Vec<TranslationEntry>,
+    // --- OID remapping for non-primary registries ---
+    oid_remap: OidRemap,
+    /// All registry object IDs (client-side) created by this client.
+    all_registry_ids: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -657,7 +691,8 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
         tracked_outputs: Vec::new(),
         output_events_delivered: false,
         monitors: Vec::new(),
-
+        oid_remap: OidRemap::new(),
+        all_registry_ids: Vec::new(),
 
     };
 
@@ -879,6 +914,11 @@ fn sniff_global(s: &mut Session, msg: &RawMsg) {
 /// After globals are collected, inject a fake `zwlr_layer_shell_v1` global
 /// if the compositor didn't advertise one.
 fn maybe_inject_layer_shell(s: &mut Session) -> Result<()> {
+    // If we already injected during get_registry, don't inject again.
+    if s.injected_layer_shell {
+        info!("layer_shell already injected early — skipping second injection");
+        return Ok(());
+    }
     let has_layer_shell = s.comp_globals.iter().any(|g| g.interface == "zwlr_layer_shell_v1");
     if has_layer_shell {
         info!("compositor has zwlr_layer_shell_v1 — no injection needed");
@@ -958,20 +998,38 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             2
         };
         info!("get_registry → cli_reg={new_id}, comp_reg={new_id}");
-        s.cli_reg_id = new_id;
-        s.comp_reg_id = new_id;
-        // Inject fake layer_shell global BEFORE compositor globals arrive
-        info!("Injecting fake layer_shell global (name={}) on registry id={}", FAKE_GLOBAL_LAYER_SHELL, new_id);
-        let evt = make_global_event(
-            new_id,
-            FAKE_GLOBAL_LAYER_SHELL,
-            LAYER_SHELL_IFACE,
-            LAYER_SHELL_VERSION,
-        );
-        let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-        s.injected_layer_shell = true;
-        s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
-        send_raw(&s.to_comp, msg)?;
+        
+        let is_first = s.all_registry_ids.is_empty();
+        s.all_registry_ids.push(new_id);
+        
+        if is_first {
+            s.cli_reg_id = new_id;
+            s.comp_reg_id = new_id;
+            // Inject fake layer_shell global BEFORE compositor globals arrive
+            info!("Injecting fake layer_shell global (name={}) on registry id={}", FAKE_GLOBAL_LAYER_SHELL, new_id);
+            let evt = make_global_event(
+                new_id,
+                FAKE_GLOBAL_LAYER_SHELL,
+                LAYER_SHELL_IFACE,
+                LAYER_SHELL_VERSION,
+            );
+            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
+            s.injected_layer_shell = true;
+            s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
+            send_raw(&s.to_comp, msg)?;
+        } else {
+            // Non-primary registry: also inject fake layer_shell
+            info!("Injecting fake layer_shell global (name={}) on secondary registry id={}", FAKE_GLOBAL_LAYER_SHELL, new_id);
+            let evt = make_global_event(
+                new_id,
+                FAKE_GLOBAL_LAYER_SHELL,
+                LAYER_SHELL_IFACE,
+                LAYER_SHELL_VERSION,
+            );
+            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
+            // Still forward the actual get_registry to compositor so it creates the registry
+            send_raw(&s.to_comp, msg)?;
+        }
         return Ok(());
     }
 
@@ -979,17 +1037,14 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
     if oid != 1 && msg.opcode() == 0 && msg.raw.len() >= 28 {
         let bind_name = u32::from_ne_bytes([msg.raw[8], msg.raw[9], msg.raw[10], msg.raw[11]]);
         
+        // Parse bind details: interface string, version, new_id
+        let (bind_iface_str, bind_version, bind_new_id) = parse_bind_payload(&msg.raw[8..]);
+        
         // Intercept fake layer_shell bind
         if bind_name == FAKE_GLOBAL_LAYER_SHELL {
             info!("  intercepted fake bind for zwlr_layer_shell_v1 on any registry (oid={})", oid);
-            let str_len = u32::from_ne_bytes([msg.raw[12], msg.raw[13], msg.raw[14], msg.raw[15]]) as usize;
-            let str_padded = (str_len + 3) & !3;
-            let new_id_offset = 16 + str_padded + 4;
-            let new_id = if new_id_offset + 4 <= msg.raw.len() {
-                u32::from_ne_bytes([msg.raw[new_id_offset], msg.raw[new_id_offset+1], msg.raw[new_id_offset+2], msg.raw[new_id_offset+3]])
-            } else { 0 };
-            if new_id > 0 && !s.fake_objects.iter().any(|f| f.cli_oid == new_id) {
-                s.fake_objects.push(FakeObject { cli_oid: new_id, iface: "zwlr_layer_shell_v1".into(), next_sub_oid: new_id + 1, data: String::new() });
+            if bind_new_id > 0 && !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
+                s.fake_objects.push(FakeObject { cli_oid: bind_new_id, iface: "zwlr_layer_shell_v1".into(), next_sub_oid: bind_new_id + 1, data: String::new() });
             }
             return Ok(());
         }
@@ -997,26 +1052,50 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         // Intercept zxdg_output_manager ONLY if the compositor doesn't have it.
         // GNOME has it, so we let it through (compositor provides real events).
         if bind_name == 5 && !s.comp_globals.iter().any(|g| g.interface == "zxdg_output_manager_v1") {
-            let str_len = u32::from_ne_bytes([msg.raw[12], msg.raw[13], msg.raw[14], msg.raw[15]]) as usize;
-            let str_padded = (str_len + 3) & !3;
-            let new_id_offset = 16 + str_padded + 4;
-            if new_id_offset + 4 <= msg.raw.len() {
-                let out_mgr_id = u32::from_ne_bytes([msg.raw[new_id_offset], msg.raw[new_id_offset+1], msg.raw[new_id_offset+2], msg.raw[new_id_offset+3]]);
-                if !s.fake_objects.iter().any(|f| f.cli_oid == out_mgr_id) {
-                    s.fake_objects.push(FakeObject { cli_oid: out_mgr_id, iface: "zxdg_output_manager_v1".into(), next_sub_oid: out_mgr_id + 1, data: String::new() });
-                    info!("  intercepted zxdg_output_manager_v1 at cli_oid={} (early bind)", out_mgr_id);
-                }
+            if bind_new_id > 0 && !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
+                s.fake_objects.push(FakeObject { cli_oid: bind_new_id, iface: "zxdg_output_manager_v1".into(), next_sub_oid: bind_new_id + 1, data: String::new() });
+                info!("  intercepted zxdg_output_manager_v1 at cli_oid={}", bind_new_id);
             }
             return Ok(());
         }
         
-        // NOTE: xdg_wm_base tracking is handled by handle_bind for primary registries.
+        // NOTE: xdg_wm_base tracking for PRIMARY registry is handled by handle_bind.
+        // For non-primary registries, xdg_wm_base binds go through OID remapping below.
+        // We don't need special handling — the remapped xdg_wm_base will work as a
+        // normal compositor object on the shared connection.
         
-        // Don't block binds on the primary registry (oid == cli_reg_id)
-        // as those go through handle_bind for proper processing.
-        
-        // Block unknown globals on non-primary registries
-        if oid != s.cli_reg_id && !s.comp_globals.iter().any(|g| g.name == bind_name) {
+        // For non-primary registries: intercept binds and remap OIDs
+        if oid != s.cli_reg_id {
+            if let Some(iface_str) = &bind_iface_str {
+                // Check if this is a known compositor global
+                let known_global = s.comp_globals.iter().find(|g| g.name == bind_name);
+                if let Some(global) = known_global {
+                    // Remap: allocate a compositor-unique OID for this bind
+                    let comp_oid = s.next_oid;
+                    s.next_oid += 1;
+                    
+                    info!("  remapping bind on registry oid={}: global name={}, iface='{}', cli_new_id={} -> comp_oid={}",
+                        oid, bind_name, iface_str, bind_new_id, comp_oid);
+                    
+                    // Create the remapped bind message
+                    let mut remapped_raw = msg.raw.clone();
+                    // new_id is at a variable offset. Use the helper to find it.
+                    if let Some(offset) = find_new_id_offset_in_bind(&msg.raw[8..]) {
+                        let pay_offset = 8 + offset;
+                        if pay_offset + 4 <= remapped_raw.len() {
+                            remapped_raw[pay_offset..pay_offset+4].copy_from_slice(&comp_oid.to_ne_bytes());
+                        }
+                    }
+                    
+                    // Store the mapping
+                    s.oid_remap.insert(bind_new_id, comp_oid, iface_str.clone());
+                    
+                    // Forward remapped bind to compositor
+                    return send_raw_raw(&s.to_comp, remapped_raw, &msg.fds);
+                }
+            }
+            
+            // Block unknown globals on non-primary registries
             info!("  blocking bind to unknown global name={} on registry oid={} (not in compositor)", bind_name, oid);
             return Ok(());
         }
@@ -1039,10 +1118,106 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
     // Now handled by early injection + bind pre-check interception.
 
 
+    // Check if this is a remapped OID from a non-primary registry
+    if let Some(&comp_oid) = s.oid_remap.to_comp.get(&oid) {
+        // Rewrite header OID and handle payload new_ids
+        let remapped = rewrite_message_for_remap(s, comp_oid, msg);
+        return send_raw_raw(&s.to_comp, remapped, &msg.fds);
+    }
+
     // Everything else: forward raw
     send_raw(&s.to_comp, msg)
 }
 
+// ─── Bind parsing helpers ───────────────────────────────────────────────────
+
+/// Parse a bind payload and return (interface_string, version, new_id).
+fn parse_bind_payload(pay: &[u8]) -> (Option<String>, u32, u32) {
+    if pay.len() < 12 { return (None, 1, 0); }
+    let str_len_raw = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]);
+    let slen = str_len_raw as usize;
+    let str_padded = (slen + 3) & !3;
+    let iface = if slen > 0 && slen < 256 && 8 + slen <= pay.len() {
+        Some(String::from_utf8_lossy(&pay[8..8+slen]).trim_end_matches('\0').to_string())
+    } else { None };
+    let ver_offset = 8 + str_padded;
+    let version = if ver_offset + 4 <= pay.len() {
+        u32::from_ne_bytes([pay[ver_offset], pay[ver_offset+1], pay[ver_offset+2], pay[ver_offset+3]])
+    } else { 1 };
+    let new_id_offset = ver_offset + 4;
+    let new_id = if new_id_offset + 4 <= pay.len() {
+        u32::from_ne_bytes([pay[new_id_offset], pay[new_id_offset+1], pay[new_id_offset+2], pay[new_id_offset+3]])
+    } else { 0 };
+    (iface, version, new_id)
+}
+
+/// Find the offset of new_id within a bind payload (relative to start of payload).
+fn find_new_id_offset_in_bind(pay: &[u8]) -> Option<usize> {
+    if pay.len() < 12 { return None; }
+    let slen = u32::from_ne_bytes([pay[4], pay[5], pay[6], pay[7]]) as usize;
+    let str_padded = (slen + 3) & !3;
+    let new_id_offset = 8 + str_padded + 4;
+    if new_id_offset + 4 <= pay.len() { Some(new_id_offset) } else { None }
+}
+
+/// Rewrite a message targeting a remapped OID.
+/// Rewrites the header OID and any create-* new_ids in the payload.
+/// NOTE: s.next_oid is incremented inside when we allocate new compositor OIDs.
+fn rewrite_message_for_remap(s: &mut Session, comp_oid: u32, msg: &RawMsg) -> Vec<u8> {
+    let oid = msg.object_id();
+    let op = msg.opcode();
+    let mut raw = msg.raw.clone();
+    raw[0..4].copy_from_slice(&comp_oid.to_ne_bytes());
+    
+    // Check if this remapped parent OID creates new objects (new_ids in payload)
+    if let Some(iface) = s.oid_remap.get_iface(oid) {
+        match iface {
+            "wl_compositor" => {
+                // op 0: create_surface(new_id) — new_id at offset 8
+                // op 1: create_region(new_id) — new_id at offset 8
+                if (op == 0 || op == 1) && raw.len() >= 12 {
+                    let cli_new = u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]);
+                    let comp_new = s.next_oid;
+                    s.next_oid += 1;
+                    raw[8..12].copy_from_slice(&comp_new.to_ne_bytes());
+                    let child_iface = if op == 0 { "wl_surface" } else { "wl_region" };
+                    s.oid_remap.insert(cli_new, comp_new, child_iface.to_string());
+                    debug!("  remapped {}({}) client_oid={} -> comp_oid={}",
+                        child_iface, op, cli_new, comp_new);
+                }
+            }
+            "wl_shm" => {
+                // op 0: create_pool(new_id, fd, size) — new_id at offset 8
+                if op == 0 && raw.len() >= 12 {
+                    let cli_new = u32::from_ne_bytes([raw[8], raw[9], raw[10], raw[11]]);
+                    let comp_new = s.next_oid;
+                    s.next_oid += 1;
+                    raw[8..12].copy_from_slice(&comp_new.to_ne_bytes());
+                    s.oid_remap.insert(cli_new, comp_new, "wl_shm_pool".to_string());
+                    debug!("  remapped wl_shm.create_pool client_oid={} -> comp_oid={}", cli_new, comp_new);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    // Also remap any wl_surface OIDs in the payload for known message types
+    // e.g., xdg_wm_base.get_xdg_surface has surface_oid at offset 12
+    if iface_name_for_oid(s, &oid).as_deref() == Some("xdg_wm_base") && op == 2 && raw.len() >= 16 {
+        let surf_oid = u32::from_ne_bytes([raw[12], raw[13], raw[14], raw[15]]);
+        if let Some(&remapped_surf) = s.oid_remap.to_comp.get(&surf_oid) {
+            raw[12..16].copy_from_slice(&remapped_surf.to_ne_bytes());
+            debug!("  remapped xdg_wm_base.get_xdg_surface surface_oid={} -> {}", surf_oid, remapped_surf);
+        }
+    }
+    
+    raw
+}
+
+/// Get the interface name for a client-side OID (either from remap or translation context).
+fn iface_name_for_oid(s: &Session, oid: &u32) -> Option<String> {
+    s.oid_remap.iface.get(oid).cloned()
+}
 
 fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
     let pay = &msg.raw[8..];
@@ -1759,6 +1934,14 @@ fn handle_comp(s: &mut Session, msg: &RawMsg) -> Result<()> {
         let err_msg = if pay.len() > 8 { String::from_utf8_lossy(&pay[8..]).trim_end_matches('\0').to_string() } else { String::new() };
         error!("COMPOSITOR PROTOCOL ERROR: object={}, code={}, msg='{}'", err_oid, err_code, err_msg);
         return send_raw(&s.to_cli, msg);
+    }
+
+    // Reverse OID remapping: if this compositor OID was remapped from a non-primary registry,
+    // rewrite the header back to the client's OID before forwarding.
+    if let Some(&cli_oid) = s.oid_remap.to_cli.get(&oid) {
+        let mut remapped = msg.raw.clone();
+        remapped[0..4].copy_from_slice(&cli_oid.to_ne_bytes());
+        return send_raw_raw(&s.to_cli, remapped, &msg.fds);
     }
 
     send_raw(&s.to_cli, msg)
