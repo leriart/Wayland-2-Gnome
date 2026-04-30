@@ -1064,55 +1064,24 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
         // We don't need special handling — the remapped xdg_wm_base will work as a
         // normal compositor object on the shared connection.
         
-        // For non-primary registries: intercept binds and remap OIDs
+        // NON-PRIMARY REGISTRIES: intercept ALL binds silently.
+        // Secondary registries (from GDK/Cairo) bind globals just to confirm they exist.
+        // They don't actually use the objects for layer_shell operations.
+        // Forwarding these binds to the shared compositor connection causes OID collisions.
         if oid != s.cli_reg_id {
             if let Some(iface_str) = &bind_iface_str {
-                // Check if this is a known compositor global
-                let known_global = s.comp_globals.iter().find(|g| g.name == bind_name);
-                if let Some(global) = known_global {
-                    // Remap: allocate a compositor-unique OID for this bind
-                    let comp_oid = s.next_oid;
-                    s.next_oid += 1;
-                    
-                    // Version clamping: client may request higher version than compositor supports
-                    let comp_version = global.version;
-                    let cli_version = bind_version;
-                    
-                    info!("  remapping bind on registry oid={}: global name={}, iface='{}', cli_new_id={} -> comp_oid={}, cli_v={}, comp_v={}",
-                        oid, bind_name, iface_str, bind_new_id, comp_oid, cli_version, comp_version);
-                    
-                    // Create the remapped bind message
-                    let mut remapped_raw = msg.raw.clone();
-                    
-                    // Clamp version to compositor's max if needed
-                    if cli_version > comp_version {
-                        if let Some(ver_offset_in_pay) = find_version_offset_in_bind(&msg.raw[8..]) {
-                            let raw_ver_offset = 8 + ver_offset_in_pay;
-                            if raw_ver_offset + 4 <= remapped_raw.len() {
-                                remapped_raw[raw_ver_offset..raw_ver_offset+4].copy_from_slice(&comp_version.to_ne_bytes());
-                                info!("  clamped bind version {} -> {} for {}", cli_version, comp_version, iface_str);
-                            }
-                        }
-                    }
-                    
-                    // Rewrite new_id
-                    if let Some(offset) = find_new_id_offset_in_bind(&msg.raw[8..]) {
-                        let pay_offset = 8 + offset;
-                        if pay_offset + 4 <= remapped_raw.len() {
-                            remapped_raw[pay_offset..pay_offset+4].copy_from_slice(&comp_oid.to_ne_bytes());
-                        }
-                    }
-                    
-                    // Store the mapping
-                    s.oid_remap.insert(bind_new_id, comp_oid, iface_str.clone());
-                    
-                    // Forward remapped bind to compositor
-                    return send_raw_raw(&s.to_comp, remapped_raw, &msg.fds);
+                info!("  intercepting bind on secondary registry oid={}: global name={}, iface='{}', new_id={}",
+                    oid, bind_name, iface_str, bind_new_id);
+                // Create a transparent fake object to absorb any messages.
+                if bind_new_id > 0 && !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
+                    s.fake_objects.push(FakeObject {
+                        cli_oid: bind_new_id,
+                        iface: format!("transparent:{}", iface_str),
+                        next_sub_oid: bind_new_id + 1,
+                        data: String::new(),
+                    });
                 }
             }
-            
-            // Block unknown globals on non-primary registries
-            info!("  blocking bind to unknown global name={} on registry oid={} (not in compositor)", bind_name, oid);
             return Ok(());
         }
     }
@@ -1385,7 +1354,7 @@ fn handle_fake_msg(s: &mut Session, fake: &FakeObject, msg: &RawMsg) -> Result<(
         "zxdg_output_v1" => handle_xdg_output_request(s, fake, msg)?,
         "xdg_wm_base" => handle_xdg_wm_base_forward(s, fake, msg)?,
         other => {
-            info!("  unknown fake iface '{other}', oid={}", fake.cli_oid);
+            debug!("  transparent/silent iface '{other}', oid={}", fake.cli_oid);
         }
     }
     Ok(())
