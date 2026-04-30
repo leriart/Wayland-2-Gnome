@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +50,22 @@ pub fn make_raw(oid: u32, op: u16, pay: &[u8]) -> Vec<u8> {
     m.extend_from_slice(&((total << 16) | op as u32).to_ne_bytes());
     m.extend_from_slice(pay);
     m
+}
+
+/// Build a wl_registry.bind payload (name, interface string, version, new_id).
+fn make_bind_payload(name: u32, iface: &str, version: u32, new_id: u32) -> Vec<u8> {
+    let mut iface_b = iface.as_bytes().to_vec();
+    iface_b.push(0);
+    let slen = iface_b.len() as u32;
+    let padded = ((slen as usize) + 3) & !3;
+    let mut pay = Vec::with_capacity(4 + 4 + padded + 8);
+    pay.extend_from_slice(&name.to_ne_bytes());
+    pay.extend_from_slice(&slen.to_ne_bytes());
+    pay.extend_from_slice(&iface_b);
+    while pay.len() < (8 + padded) { pay.push(0); }
+    pay.extend_from_slice(&version.to_ne_bytes());
+    pay.extend_from_slice(&new_id.to_ne_bytes());
+    pay
 }
 
 /// Send one complete Wayland wire message (data + optional FDs) via sendmsg.
@@ -673,23 +690,6 @@ fn session(to_cli: UnixStream, to_comp: UnixStream) -> Result<()> {
 
     };
 
-    // Inject fake layer_shell global BEFORE event loop starts.
-    // This puts it in the client's receive buffer immediately, so the
-    // client sees it before any compositor globals arrive.
-    // We send it with a placeholder registry OID that will be valid
-    // once the client sends get_registry (first message after connect).
-    info!("Pre-injecting fake layer_shell global on client socket");
-    let pre_evt = make_global_event(2, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
-    let _ = send_raw(&s.to_cli, &RawMsg { raw: pre_evt, fds: Vec::new() });
-    s.injected_layer_shell = true;
-    s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
-    // Also add to comp_globals so maybe_inject_layer_shell doesn't duplicate
-    s.comp_globals.push(GlobalInfo {
-        name: FAKE_GLOBAL_LAYER_SHELL,
-        interface: "zwlr_layer_shell_v1".into(),
-        version: LAYER_SHELL_VERSION,
-    });
-
     // Use calloop-based event loop for this session.
     let mut evloop: EventLoop<Session> = EventLoop::try_new()?;
     let signal = Arc::new(std::sync::Mutex::new(Some(evloop.get_signal())));
@@ -1005,14 +1005,13 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             s.fake_global_name = Some(FAKE_GLOBAL_LAYER_SHELL);
             send_raw(&s.to_comp, msg)?;
         } else {
-            // Secondary registry: inject globals directly (not forwarded to Mutter).
-            info!("Secondary registry cli={}: injecting globals", new_id);
+            // Secondary registry: forward + inject layer_shell.
+            // gtk-layer-shell creates its OWN registry via GDK to bind layer_shell.
+            // We must inject on ALL registries so GDK finds it.
+            info!("Forwarding get_registry for secondary registry id={} + layer_shell injection", new_id);
             let evt = make_global_event(new_id, FAKE_GLOBAL_LAYER_SHELL, LAYER_SHELL_IFACE, LAYER_SHELL_VERSION);
             let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-            let evt = make_global_event(new_id, 1, "wl_compositor", 6);
-            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
-            let evt = make_global_event(new_id, 10, "xdg_wm_base", 7);
-            let _ = send_raw(&s.to_cli, &RawMsg { raw: evt, fds: Vec::new() });
+            send_raw(&s.to_comp, msg)?;
         }
         return Ok(());
     }
@@ -1030,34 +1029,38 @@ fn handle_cli(s: &mut Session, msg: &RawMsg) -> Result<()> {
             if bind_new_id > 0 && !s.fake_objects.iter().any(|f| f.cli_oid == bind_new_id) {
                 s.fake_objects.push(FakeObject { cli_oid: bind_new_id, iface: "zwlr_layer_shell_v1".into(), next_sub_oid: bind_new_id + 1, data: String::new() });
             }
+            // Forward a dummy wl_compositor bind to Mutter at the same OID
+            // to fill the gap. Mutter requires contiguous OIDs and this OID
+            // would otherwise be skipped.
+            if oid == s.cli_reg_id {
+                let fill = make_raw(oid, 0, &make_bind_payload(1, "wl_compositor", 1, bind_new_id));
+                let _ = send_raw_raw(&s.to_comp, fill, &[]);
+            }
             return Ok(());
         }
         
         // zxdg_output_manager_v1: forward to compositor
 
-        // NON-PRIMARY REGISTRIES: secondary registries not forwarded to Mutter.
-        // Intercept specific binds and redirect to primary objects.
+        // NON-PRIMARY REGISTRIES: forward binds to compositor with version clamping.
+        // (The primary registry goes through handle_bind below, which does the same.)
         if oid != s.cli_reg_id {
-            if bind_name == 1 {
-                // wl_compositor: redirect to primary compositor
-                if s.comp_compositor_name != 0 {
-                    let fake = FakeObject { cli_oid: bind_new_id, iface: "wl_compositor".into(),
-                        next_sub_oid: bind_new_id + 1,
-                        data: s.comp_compositor_id.to_string() };
-                    s.fake_objects.push(fake);
-                    info!("  secondary wl_compositor bind → redirect to oid={}", s.comp_compositor_id);
+            if let Some(iface_str) = &bind_iface_str {
+                let known_global = s.comp_globals.iter().find(|g| g.name == bind_name);
+                if let Some(global) = known_global {
+                    let comp_version = global.version;
+                    let mut raw = msg.raw.clone();
+                    if bind_version > comp_version {
+                        if let Some(ver_off) = find_version_offset_in_bind(&msg.raw[8..]) {
+                            raw[8+ver_off..8+ver_off+4].copy_from_slice(&comp_version.to_ne_bytes());
+                        }
+                    }
+                    info!("  bind on registry oid={}: name={}, iface='{}', new_id={}, cli_v={}, comp_v={}",
+                        oid, bind_name, iface_str, bind_new_id, bind_version, comp_version);
+                    return send_raw_raw(&s.to_comp, raw, &msg.fds);
+                } else {
+                    info!("  blocking bind to unknown global name={} on registry oid={}", bind_name, oid);
+                    return Ok(());
                 }
-            } else if bind_name == 10 {
-                // xdg_wm_base: redirect to primary
-                if s.cli_xdg_wm_base_id != 0 {
-                    let fake = FakeObject { cli_oid: bind_new_id, iface: "xdg_wm_base".into(),
-                        next_sub_oid: bind_new_id + 1,
-                        data: s.cli_xdg_wm_base_id.to_string() };
-                    s.fake_objects.push(fake);
-                    info!("  secondary xdg_wm_base bind → redirect to oid={}", s.cli_xdg_wm_base_id);
-                }
-            } else {
-                info!("  secondary bind ignored: name={} new_id={}", bind_name, bind_new_id);
             }
             return Ok(());
         }
@@ -1178,6 +1181,9 @@ fn handle_bind(s: &mut Session, msg: &RawMsg) -> Result<()> {
                 data: String::new(),
             });
         }
+        // Forward a dummy wl_compositor bind to fill the OID gap on Mutter
+        let fill = make_raw(msg.object_id(), 0, &make_bind_payload(1, "wl_compositor", 1, new_id));
+        let _ = send_raw_raw(&s.to_comp, fill, &[]);
         return Ok(());
     }
 
@@ -1301,7 +1307,7 @@ fn handle_xdg_output_manager_request(s: &mut Session, fake: &FakeObject, msg: &R
 
             // Now send synthetic xdg_output events to the client so it doesn't hang.
             // Logical position from our monitor tracking:
-            let (lx, ly) = s.monitors.iter()
+            let (lx, ly): (i32, i32) = s.monitors.iter()
                 .find(|m| m.comp_oid == output_oid)
                 .map(|m| (m.x, m.y))
                 .unwrap_or((0, 0));
